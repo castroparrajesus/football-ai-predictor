@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   DEFAULT_ENSEMBLE_WEIGHTS,
   DEFAULT_QUALITY_THRESHOLDS,
@@ -13,13 +13,16 @@ import {
   SANDBOX_TEAMS,
 } from './data/sandboxDataset';
 import {
+  CalibrationBin,
   DataSourceMode,
+  DbStatusSummary,
   EnsembleWeights,
   LeagueFilter,
   MatchRecord,
   NavSectionId,
   PredictionHistoryItem,
   QualityFilterThresholds,
+  TeamStatisticalProfile,
   ValueOpportunity,
 } from './types/football';
 import {
@@ -29,11 +32,20 @@ import {
   computeLogLossBinary,
   computePoissonScoreMatrix,
 } from './utils/previewMath';
-import { CSV_TEMPLATE_CONTENT, parseMatchesCsv } from './utils/csvImporter';
+import {
+  CSV_TEMPLATE_CONTENT,
+  CsvParseResult,
+  parseMatchesCsv,
+} from './utils/csvImporter';
+import { apiClient } from './services/apiClient';
 import { Sidebar } from './components/layout/Sidebar';
 import { TopBar } from './components/layout/TopBar';
 import { DataSourceBanner } from './components/ui/DataSourceBanner';
-import { MatchAnalyzerDrawer } from './components/MatchAnalyzerDrawer';
+import {
+  MatchAnalyzerDrawer,
+  PredictionSnapshotPayload,
+} from './components/MatchAnalyzerDrawer';
+import { CsvImportModal } from './components/CsvImportModal';
 import { DashboardView } from './views/DashboardView';
 import { MatchesTodayView } from './views/MatchesTodayView';
 import { LeaguesView } from './views/LeaguesView';
@@ -51,44 +63,143 @@ export default function App() {
   const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>('sandbox');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const [csvMatches, setCsvMatches] = useState<MatchRecord[]>([]);
-  const [csvErrors, setCsvErrors] = useState<string[]>([]);
+  // Estado real de PostgreSQL / Supabase
+  const [dbStatus, setDbStatus] = useState<DbStatusSummary | null>(null);
+  const [dbMatches, setDbMatches] = useState<MatchRecord[]>([]);
+  const [dbTeams, setDbTeams] = useState<TeamStatisticalProfile[]>([]);
+  const [dbHistory, setDbHistory] = useState<PredictionHistoryItem[]>([]);
+  const [dbCalibrationBins, setDbCalibrationBins] = useState<CalibrationBin[]>([]);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
 
+  // CSV temporal y modal de confirmación
+  const [csvMatches, setCsvMatches] = useState<MatchRecord[]>([]);
+  const [csvErrorsCount, setCsvErrorsCount] = useState<number>(0);
+  const [pendingCsvFile, setPendingCsvFile] = useState<{
+    filename: string;
+    result: CsvParseResult;
+  } | null>(null);
+  const [isSavingCsvDb, setIsSavingCsvDb] = useState(false);
+  const [csvSaveError, setCsvSaveError] = useState<string | null>(null);
+
+  // Pesos y umbrales
   const [weights, setWeights] = useState<EnsembleWeights>(DEFAULT_ENSEMBLE_WEIGHTS);
   const [thresholds, setThresholds] = useState<QualityFilterThresholds>(
     DEFAULT_QUALITY_THRESHOLDS
   );
 
+  // Analizador e historial sandbox aislado
   const [analyzedMatch, setAnalyzedMatch] = useState<MatchRecord | null>(null);
   const [sandboxHistory, setSandboxHistory] = useState<PredictionHistoryItem[]>(SANDBOX_HISTORY);
-  const [customHistory, setCustomHistory] = useState<PredictionHistoryItem[]>([]);
+
+  const loadPersistedData = useCallback(async (league: LeagueFilter) => {
+    const [matchesRes, teamsRes, historyRes, perfRes, configRes] = await Promise.all([
+      apiClient.getMatches(league),
+      apiClient.getTeams(league),
+      apiClient.getPredictionHistory(league),
+      apiClient.getPerformance(league),
+      apiClient.getModelConfig(),
+    ]);
+    setDbMatches(matchesRes);
+    setDbTeams(teamsRes);
+    setDbHistory(historyRes);
+    setDbCalibrationBins(perfRes.calibrationBins);
+    if (configRes) {
+      setWeights(configRes.weights);
+      setThresholds(configRes.thresholds);
+    }
+  }, []);
+
+  const refreshDbHealth = useCallback(
+    async (autoSwitchOnFirstReady = false) => {
+      try {
+        const status = await apiClient.getDbHealth();
+        setDbStatus(status);
+        if (status.connected && status.schemaReady) {
+          await loadPersistedData(selectedLeague);
+          if (autoSwitchOnFirstReady) {
+            setDataSourceMode('database');
+          }
+        }
+      } catch (err) {
+        console.error('Error checking DB health:', err);
+      }
+    },
+    [loadPersistedData, selectedLeague]
+  );
+
+  useEffect(() => {
+    refreshDbHealth(true);
+    // Solo comprobación inicial al montar
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (dataSourceMode === 'database' && dbStatus?.connected && dbStatus?.schemaReady) {
+      loadPersistedData(selectedLeague).catch((err) => {
+        console.error('Error reloading DB data on league filter:', err);
+      });
+    }
+  }, [selectedLeague, dataSourceMode, dbStatus?.connected, dbStatus?.schemaReady, loadPersistedData]);
+
+  const handleRunMigrations = async () => {
+    setIsMigrating(true);
+    setMigrationMessage(null);
+    try {
+      const res = await apiClient.runMigrations();
+      const msg =
+        res.applied.length > 0
+          ? `Migraciones aplicadas: ${res.applied.join(', ')}.`
+          : 'Todas las migraciones ya estaban aplicadas.';
+      setMigrationMessage(msg);
+      await refreshDbHealth(true);
+    } catch (err) {
+      setMigrationMessage(err instanceof Error ? err.message : 'Error ejecutando migraciones.');
+    } finally {
+      setIsMigrating(false);
+    }
+  };
 
   const activeMatches = useMemo(() => {
     const raw =
-      dataSourceMode === 'sandbox'
+      dataSourceMode === 'database'
+        ? dbMatches
+        : dataSourceMode === 'sandbox'
         ? SANDBOX_MATCHES
         : dataSourceMode === 'csv'
         ? csvMatches
         : [];
     if (selectedLeague === 'all') return raw;
     return raw.filter((m) => m.leagueId === selectedLeague);
-  }, [dataSourceMode, csvMatches, selectedLeague]);
+  }, [dataSourceMode, dbMatches, csvMatches, selectedLeague]);
 
   const activeTeams = useMemo(() => {
-    if (dataSourceMode !== 'sandbox') return [];
-    if (selectedLeague === 'all') return SANDBOX_TEAMS;
-    return SANDBOX_TEAMS.filter((t) => t.leagueId === selectedLeague);
-  }, [dataSourceMode, selectedLeague]);
+    const raw =
+      dataSourceMode === 'database'
+        ? dbTeams
+        : dataSourceMode === 'sandbox'
+        ? SANDBOX_TEAMS
+        : [];
+    if (selectedLeague === 'all') return raw;
+    return raw.filter((t) => t.leagueId === selectedLeague);
+  }, [dataSourceMode, dbTeams, selectedLeague]);
 
   const activeHistory = useMemo(() => {
-    const base = dataSourceMode === 'sandbox' ? sandboxHistory : customHistory;
-    if (selectedLeague === 'all') return base;
-    return base.filter((h) => h.leagueId === selectedLeague);
-  }, [dataSourceMode, sandboxHistory, customHistory, selectedLeague]);
+    const raw =
+      dataSourceMode === 'database'
+        ? dbHistory
+        : dataSourceMode === 'sandbox'
+        ? sandboxHistory
+        : [];
+    if (selectedLeague === 'all') return raw;
+    return raw.filter((h) => h.leagueId === selectedLeague);
+  }, [dataSourceMode, dbHistory, sandboxHistory, selectedLeague]);
 
   const activeCalibrationBins = useMemo(() => {
-    return dataSourceMode === 'sandbox' ? SANDBOX_CALIBRATION_BINS : [];
-  }, [dataSourceMode]);
+    if (dataSourceMode === 'database') return dbCalibrationBins;
+    if (dataSourceMode === 'sandbox') return SANDBOX_CALIBRATION_BINS;
+    return [];
+  }, [dataSourceMode, dbCalibrationBins]);
 
   const valueOpportunities = useMemo<ValueOpportunity[]>(() => {
     const list: ValueOpportunity[] = [];
@@ -196,12 +307,42 @@ export default function App() {
     reader.onload = () => {
       const content = typeof reader.result === 'string' ? reader.result : '';
       const result = parseMatchesCsv(content);
-      setCsvMatches(result.matches);
-      setCsvErrors(result.errors);
-      setDataSourceMode('csv');
-      setActiveSection('matches_today');
+      setCsvSaveError(null);
+      setPendingCsvFile({ filename: file.name, result });
     };
     reader.readAsText(file);
+  };
+
+  const handleConfirmSaveCsvDb = async () => {
+    if (!pendingCsvFile) return;
+    setIsSavingCsvDb(true);
+    setCsvSaveError(null);
+    try {
+      await apiClient.importCsvToDb(
+        pendingCsvFile.filename,
+        pendingCsvFile.result.dbRows
+      );
+      setPendingCsvFile(null);
+      setDataSourceMode('database');
+      await refreshDbHealth(false);
+      await loadPersistedData(selectedLeague);
+      setActiveSection('matches_today');
+    } catch (err) {
+      setCsvSaveError(
+        err instanceof Error ? err.message : 'Error guardando archivo CSV en PostgreSQL.'
+      );
+    } finally {
+      setIsSavingCsvDb(false);
+    }
+  };
+
+  const handleUseCsvPreviewOnly = () => {
+    if (!pendingCsvFile) return;
+    setCsvMatches(pendingCsvFile.result.matches);
+    setCsvErrorsCount(pendingCsvFile.result.errors.length);
+    setPendingCsvFile(null);
+    setDataSourceMode('csv');
+    setActiveSection('matches_today');
   };
 
   const handleDownloadCsvTemplate = () => {
@@ -216,41 +357,72 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleSavePrediction = (item: PredictionHistoryItem) => {
+  const handleSavePrediction = async (
+    item: PredictionHistoryItem,
+    payload: PredictionSnapshotPayload
+  ) => {
+    if (dataSourceMode === 'database' && dbStatus?.connected && dbStatus?.schemaReady) {
+      await apiClient.createPredictionSnapshot(payload);
+      await refreshDbHealth(false);
+      await loadPersistedData(selectedLeague);
+      return;
+    }
+
     if (dataSourceMode === 'sandbox') {
       setSandboxHistory((prev) => [item, ...prev]);
-    } else {
-      setCustomHistory((prev) => [item, ...prev]);
     }
   };
 
-  const handleSettlePrediction = (id: string, outcome: 0 | 1, actualScore: string) => {
-    const updater = (prev: PredictionHistoryItem[]) =>
-      prev.map((item) => {
-        if (item.id !== id) return item;
-        return {
-          ...item,
-          status: outcome === 1 ? ('acertada' as const) : ('fallada' as const),
-          actualResult: actualScore,
-          brierScore: Number(computeBrierScoreBinary(item.predictedProb, outcome).toFixed(4)),
-          logLoss: Number(computeLogLossBinary(item.predictedProb, outcome).toFixed(4)),
-          simulatedRoiUnit: Number((outcome === 1 ? item.oddsAtPrediction - 1 : -1).toFixed(2)),
-        };
-      });
+  const handleSettlePrediction = async (id: string, outcome: 0 | 1, actualScore: string) => {
+    if (dataSourceMode === 'database' && dbStatus?.connected && dbStatus?.schemaReady) {
+      await apiClient.settlePrediction(id, outcome, actualScore);
+      await loadPersistedData(selectedLeague);
+      return;
+    }
 
     if (dataSourceMode === 'sandbox') {
-      setSandboxHistory(updater);
-    } else {
-      setCustomHistory(updater);
+      setSandboxHistory((prev) =>
+        prev.map((item) => {
+          if (item.id !== id) return item;
+          return {
+            ...item,
+            status: outcome === 1 ? 'acertada' : 'fallada',
+            actualResult: actualScore,
+            brierScore: Number(computeBrierScoreBinary(item.predictedProb, outcome).toFixed(4)),
+            logLoss: Number(computeLogLossBinary(item.predictedProb, outcome).toFixed(4)),
+            simulatedRoiUnit: Number((outcome === 1 ? item.oddsAtPrediction - 1 : -1).toFixed(2)),
+          };
+        })
+      );
+    }
+  };
+
+  const handleUpdateWeights = (nextWeights: EnsembleWeights) => {
+    setWeights(nextWeights);
+    if (dataSourceMode === 'database' && dbStatus?.connected && dbStatus?.schemaReady) {
+      apiClient.updateModelConfig(nextWeights, thresholds).catch((err) => {
+        console.error('Failed to persist ensemble weights:', err);
+      });
+    }
+  };
+
+  const handleUpdateThresholds = (nextThresholds: QualityFilterThresholds) => {
+    setThresholds(nextThresholds);
+    if (dataSourceMode === 'database' && dbStatus?.connected && dbStatus?.schemaReady) {
+      apiClient.updateModelConfig(weights, nextThresholds).catch((err) => {
+        console.error('Failed to persist thresholds:', err);
+      });
     }
   };
 
   const analyzedHomeTeam = analyzedMatch
-    ? SANDBOX_TEAMS.find((t) => t.id === analyzedMatch.homeTeamId)
+    ? activeTeams.find((t) => t.id === analyzedMatch.homeTeamId)
     : undefined;
   const analyzedAwayTeam = analyzedMatch
-    ? SANDBOX_TEAMS.find((t) => t.id === analyzedMatch.awayTeamId)
+    ? activeTeams.find((t) => t.id === analyzedMatch.awayTeamId)
     : undefined;
+
+  const isDbReady = Boolean(dbStatus?.connected && dbStatus?.schemaReady);
 
   return (
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex">
@@ -268,6 +440,7 @@ export default function App() {
           onChangeLeague={setSelectedLeague}
           dataSourceMode={dataSourceMode}
           onChangeDataSource={setDataSourceMode}
+          dbStatus={dbStatus}
           onImportCsvFile={handleImportCsvFile}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
         />
@@ -275,10 +448,12 @@ export default function App() {
         <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-7xl w-full mx-auto space-y-6">
           <DataSourceBanner
             mode={dataSourceMode}
+            dbStatus={dbStatus}
             csvCount={csvMatches.length}
-            csvErrors={csvErrors}
+            csvErrorsCount={csvErrorsCount}
             onSwitchMode={setDataSourceMode}
             onDownloadTemplate={handleDownloadCsvTemplate}
+            onOpenSettings={() => setActiveSection('settings')}
           />
 
           {activeSection === 'dashboard' && (
@@ -290,10 +465,10 @@ export default function App() {
               valueOpportunities={valueOpportunities}
               thresholds={thresholds}
               onToggleStrictNoForce={() =>
-                setThresholds((prev) => ({
-                  ...prev,
-                  strictModeNoForce: !prev.strictModeNoForce,
-                }))
+                handleUpdateThresholds({
+                  ...thresholds,
+                  strictModeNoForce: !thresholds.strictModeNoForce,
+                })
               }
               onAnalyzeMatch={setAnalyzedMatch}
               onNavigate={setActiveSection}
@@ -344,7 +519,7 @@ export default function App() {
             <ModelComparatorView
               matches={activeMatches}
               weights={weights}
-              onUpdateWeights={setWeights}
+              onUpdateWeights={handleUpdateWeights}
             />
           )}
 
@@ -366,8 +541,13 @@ export default function App() {
             <SettingsView
               dataSourceMode={dataSourceMode}
               onChangeDataSource={setDataSourceMode}
+              dbStatus={dbStatus}
+              isMigrating={isMigrating}
+              migrationMessage={migrationMessage}
+              onRefreshDbStatus={() => refreshDbHealth(false)}
+              onRunMigrations={handleRunMigrations}
               thresholds={thresholds}
-              onUpdateThresholds={setThresholds}
+              onUpdateThresholds={handleUpdateThresholds}
               onDownloadCsvTemplate={handleDownloadCsvTemplate}
             />
           )}
@@ -376,11 +556,22 @@ export default function App() {
 
       <MatchAnalyzerDrawer
         match={analyzedMatch}
-        homeTeam={analyzedMatch?.isSynthetic ? analyzedHomeTeam : undefined}
-        awayTeam={analyzedMatch?.isSynthetic ? analyzedAwayTeam : undefined}
+        homeTeam={analyzedHomeTeam}
+        awayTeam={analyzedAwayTeam}
         weights={weights}
         onClose={() => setAnalyzedMatch(null)}
         onSavePrediction={handleSavePrediction}
+      />
+
+      <CsvImportModal
+        filename={pendingCsvFile?.filename ?? ''}
+        parseResult={pendingCsvFile?.result ?? null}
+        dbReady={isDbReady}
+        isSaving={isSavingCsvDb}
+        saveError={csvSaveError}
+        onCancel={() => setPendingCsvFile(null)}
+        onConfirmSaveDb={handleConfirmSaveCsvDb}
+        onUseLocalPreviewOnly={handleUseCsvPreviewOnly}
       />
     </div>
   );

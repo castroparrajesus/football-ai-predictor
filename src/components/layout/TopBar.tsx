@@ -1,7 +1,7 @@
 import React, { useRef } from 'react';
 import { Menu, Upload } from 'lucide-react';
 import { LEAGUES_CATALOG } from '../../data/sandboxDataset';
-import { DataSourceMode, LeagueFilter, NavSectionId } from '../../types/football';
+import { DataSourceMode, DbStatusSummary, LeagueFilter, NavSectionId } from '../../types/football';
 import { NAV_ITEMS } from './Sidebar';
 
 interface TopBarProps {
@@ -10,6 +10,7 @@ interface TopBarProps {
   onChangeLeague: (league: LeagueFilter) => void;
   dataSourceMode: DataSourceMode;
   onChangeDataSource: (mode: DataSourceMode) => void;
+  dbStatus: DbStatusSummary | null;
   onImportCsvFile: (file: File) => void;
   onOpenMobileMenu: () => void;
 }
@@ -20,6 +21,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onChangeLeague,
   dataSourceMode,
   onChangeDataSource,
+  dbStatus,
   onImportCsvFile,
   onOpenMobileMenu,
 }) => {
@@ -33,6 +35,21 @@ export const TopBar: React.FC<TopBarProps> = ({
       e.target.value = '';
     }
   };
+
+  const dbLabel = !dbStatus
+    ? 'BD: Verificando...'
+    : dbStatus.connected && dbStatus.schemaReady
+    ? 'BD: PostgreSQL conectado'
+    : dbStatus.configured && dbStatus.connected
+    ? 'BD: Migración pendiente'
+    : 'BD: Sin configurar';
+
+  const dbColorClass =
+    dbStatus?.connected && dbStatus?.schemaReady
+      ? 'text-emerald-400'
+      : dbStatus?.configured && !dbStatus?.connected
+      ? 'text-rose-400'
+      : 'text-amber-400';
 
   return (
     <header className="sticky top-0 z-30 h-16 bg-[#0B0F17]/95 backdrop-blur border-b border-slate-800/80 px-4 sm:px-6 flex items-center justify-between gap-4">
@@ -56,6 +73,12 @@ export const TopBar: React.FC<TopBarProps> = ({
           <h1 className="font-display font-semibold text-slate-100 truncate">
             {currentNav?.label ?? 'Dashboard'}
           </h1>
+          <span className="hidden xl:inline text-slate-700" aria-hidden="true">
+            ·
+          </span>
+          <span className={`hidden xl:inline text-xs font-mono whitespace-nowrap ${dbColorClass}`}>
+            {dbLabel}
+          </span>
         </div>
       </div>
 
@@ -86,8 +109,9 @@ export const TopBar: React.FC<TopBarProps> = ({
           onChange={(e) => onChangeDataSource(e.target.value as DataSourceMode)}
           className="hidden md:block h-9 px-3 rounded-lg bg-[#111827] border border-slate-800 text-xs sm:text-sm text-slate-200 focus:outline-none focus:border-emerald-500 whitespace-nowrap"
         >
+          <option value="database">Base de datos (PostgreSQL)</option>
           <option value="sandbox">Sandbox (Datos de prueba)</option>
-          <option value="csv">CSV importado</option>
+          <option value="csv">CSV temporal</option>
           <option value="none">Sin datos (Vacío)</option>
         </select>
 

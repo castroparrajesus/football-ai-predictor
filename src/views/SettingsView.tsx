@@ -1,10 +1,19 @@
 import React from 'react';
-import { Download } from 'lucide-react';
-import { DataSourceMode, QualityFilterThresholds } from '../types/football';
+import { Database, Download, RefreshCw } from 'lucide-react';
+import {
+  DataSourceMode,
+  DbStatusSummary,
+  QualityFilterThresholds,
+} from '../types/football';
 
 interface SettingsViewProps {
   dataSourceMode: DataSourceMode;
   onChangeDataSource: (mode: DataSourceMode) => void;
+  dbStatus: DbStatusSummary | null;
+  isMigrating: boolean;
+  migrationMessage: string | null;
+  onRefreshDbStatus: () => void;
+  onRunMigrations: () => void;
   thresholds: QualityFilterThresholds;
   onUpdateThresholds: (next: QualityFilterThresholds) => void;
   onDownloadCsvTemplate: () => void;
@@ -13,7 +22,7 @@ interface SettingsViewProps {
 const PHASES_ROADMAP = [
   { phase: 'Fase 1', title: 'Diseño de arquitectura y estructura de carpetas', status: 'Completada' },
   { phase: 'Fase 2', title: 'Construcción de interfaz Dark Mode y Dashboard', status: 'Completada' },
-  { phase: 'Fase 3', title: 'Base de datos PostgreSQL y esquema de equipos/ligas/partidos', status: 'Pendiente' },
+  { phase: 'Fase 3', title: 'Base de datos PostgreSQL (Supabase) y persistencia', status: 'Implementada (pendiente credenciales)' },
   { phase: 'Fase 4', title: 'Integración de fuentes de datos reales (Provider Adapter)', status: 'Pendiente' },
   { phase: 'Fase 5', title: 'Implementación del modelo Poisson / Dixon-Coles en backend', status: 'Pendiente' },
   { phase: 'Fase 6', title: 'Elo dinámico y modelos Machine Learning', status: 'Pendiente' },
@@ -54,21 +63,130 @@ const DATA_PROVIDERS = [
 export const SettingsView: React.FC<SettingsViewProps> = ({
   dataSourceMode,
   onChangeDataSource,
+  dbStatus,
+  isMigrating,
+  migrationMessage,
+  onRefreshDbStatus,
+  onRunMigrations,
   thresholds,
   onUpdateThresholds,
   onDownloadCsvTemplate,
 }) => {
+  const fase3StatusText =
+    dbStatus?.connected && dbStatus?.schemaReady
+      ? 'Completada y conectada'
+      : 'Implementada (esperando Supabase)';
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="font-display text-lg font-semibold text-slate-100">
-          Configuración, Proveedores de Datos y Plan de Fases
+          Configuración, Base de Datos Supabase y Plan de Fases
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
-          Ajusta umbrales de filtro estadístico, gestiona el modo de datos y revisa los conectores
-          planificados. No existen claves API simuladas.
+          Estado real de conexión a PostgreSQL, ejecución de migraciones, umbrales estadísticos y
+          separación de orígenes de datos.
         </p>
       </div>
+
+      {/* Supabase / PostgreSQL Connection Status Panel */}
+      <section className="rounded-lg border border-slate-800/80 bg-[#111827] p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <Database className="w-4 h-4 text-emerald-400 shrink-0" />
+            <h3 className="font-display text-sm font-semibold text-slate-100">
+              Conexión PostgreSQL (Supabase)
+            </h3>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onRefreshDbStatus}
+              className="px-3 py-1.5 rounded-md border border-slate-700 hover:bg-slate-800 text-xs font-medium text-slate-200 inline-flex items-center gap-1.5"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Verificar conexión</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onRunMigrations}
+              disabled={!dbStatus?.connected || isMigrating}
+              className="px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-medium text-white"
+            >
+              {isMigrating ? 'Ejecutando...' : 'Ejecutar migraciones SQL'}
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono tabular-nums">
+          <div className="p-3 rounded-md border border-slate-800 bg-[#0B0F17]">
+            <div className="font-sans text-slate-400">Estado conexión</div>
+            <div
+              className={`mt-1 font-semibold ${
+                dbStatus?.connected ? 'text-emerald-400' : 'text-rose-400'
+              }`}
+            >
+              {dbStatus?.connected ? 'CONECTADA' : dbStatus?.configured ? 'ERROR DE RED' : 'NO CONFIGURADA'}
+            </div>
+          </div>
+          <div className="p-3 rounded-md border border-slate-800 bg-[#0B0F17]">
+            <div className="font-sans text-slate-400">Esquema SQL</div>
+            <div
+              className={`mt-1 font-semibold ${
+                dbStatus?.schemaReady ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            >
+              {dbStatus?.schemaReady ? 'MIGRADO (15 tablas)' : 'PENDIENTE'}
+            </div>
+          </div>
+          <div className="p-3 rounded-md border border-slate-800 bg-[#0B0F17]">
+            <div className="font-sans text-slate-400">Partidos / Equipos BD</div>
+            <div className="mt-1 text-slate-100">
+              {dbStatus?.counts.matches ?? 0} / {dbStatus?.counts.teams ?? 0}
+            </div>
+          </div>
+          <div className="p-3 rounded-md border border-slate-800 bg-[#0B0F17]">
+            <div className="font-sans text-slate-400">Pronósticos guardados</div>
+            <div className="mt-1 text-slate-100">{dbStatus?.counts.predictions ?? 0}</div>
+          </div>
+        </div>
+
+        {dbStatus?.error && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/8 p-3 text-xs text-amber-200 space-y-1">
+            <div className="font-semibold">Diagnóstico:</div>
+            <p>{dbStatus.error}</p>
+            <p className="text-slate-300">
+              Configura <code className="font-mono text-slate-100">DATABASE_URL</code>,{' '}
+              <code className="font-mono text-slate-100">SUPABASE_URL</code> y{' '}
+              <code className="font-mono text-slate-100">SUPABASE_ANON_KEY</code> en el panel
+              Secrets siguiendo <code className="font-mono text-slate-100">SUPABASE_SETUP.md</code>.
+            </p>
+          </div>
+        )}
+
+        {migrationMessage && (
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-200">
+            {migrationMessage}
+          </div>
+        )}
+
+        <div className="text-[11px] text-slate-400 font-mono flex flex-wrap gap-x-6 gap-y-1">
+          <span>
+            Última importación:{' '}
+            {dbStatus?.lastImportAt
+              ? `${dbStatus.lastImportAt.slice(0, 19).replace('T', ' ')} UTC (${dbStatus.lastImportFilename ?? 'CSV'})`
+              : 'Ninguna'}
+          </span>
+          <span>
+            Último pronóstico:{' '}
+            {dbStatus?.lastPredictionAt
+              ? `${dbStatus.lastPredictionAt.slice(0, 19).replace('T', ' ')} UTC`
+              : 'Ninguno'}
+          </span>
+        </div>
+      </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Quality Filter Settings */}
@@ -171,16 +289,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         {/* Data Source & CSV */}
         <section className="rounded-lg border border-slate-800/80 bg-[#111827] p-5 space-y-4">
           <h3 className="font-display text-sm font-semibold text-slate-100">
-            Origen de Datos y Exportación de Plantilla
+            Origen de Datos y Plantilla CSV
           </h3>
 
           <div className="space-y-3 text-xs">
             <div className="flex flex-wrap gap-2">
               {(
                 [
-                  ['sandbox', 'Sandbox de prueba (Sintético)'],
-                  ['csv', 'Archivo CSV importado'],
-                  ['none', 'Sin datos (Estado limpio)'],
+                  ['database', 'Base de datos (PostgreSQL)'],
+                  ['sandbox', 'Sandbox aislado (Sintético)'],
+                  ['csv', 'CSV temporal en memoria'],
+                  ['none', 'Sin datos'],
                 ] as [DataSourceMode, string][]
               ).map(([modeId, label]) => (
                 <button
@@ -200,8 +319,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <div className="pt-3 border-t border-slate-800 flex items-center justify-between gap-4">
               <div className="text-slate-400">
-                Descarga una plantilla CSV compatible (incluye soporte para columnas estándar tipo
-                Football-Data.co.uk como HomeTeam, AwayTeam, B365H/D/A).
+                Descarga la plantilla CSV compatible (soporta también cabeceras de
+                Football-Data.co.uk como HomeTeam, AwayTeam, FTHG, FTAG, B365H/D/A, HS/AS, HC/AC).
               </div>
               <button
                 type="button"
@@ -251,24 +370,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           Estado del Plan de Desarrollo (Fases 1–11)
         </h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-xs">
-          {PHASES_ROADMAP.map((item) => (
-            <div
-              key={item.phase}
-              className="px-3.5 py-2.5 rounded-md border border-slate-800 bg-[#0B0F17] flex items-center justify-between gap-3"
-            >
-              <div>
-                <span className="font-mono text-slate-400 mr-2">{item.phase}:</span>
-                <span className="text-slate-200">{item.title}</span>
-              </div>
-              <span
-                className={`font-mono whitespace-nowrap ${
-                  item.status === 'Completada' ? 'text-emerald-400' : 'text-slate-500'
-                }`}
+          {PHASES_ROADMAP.map((item) => {
+            const label = item.phase === 'Fase 3' ? fase3StatusText : item.status;
+            const isDone = label.startsWith('Completada');
+            return (
+              <div
+                key={item.phase}
+                className="px-3.5 py-2.5 rounded-md border border-slate-800 bg-[#0B0F17] flex items-center justify-between gap-3"
               >
-                {item.status}
-              </span>
-            </div>
-          ))}
+                <div>
+                  <span className="font-mono text-slate-400 mr-2">{item.phase}:</span>
+                  <span className="text-slate-200">{item.title}</span>
+                </div>
+                <span
+                  className={`font-mono whitespace-nowrap ${
+                    isDone ? 'text-emerald-400' : label.includes('Implementada') ? 'text-amber-300' : 'text-slate-500'
+                  }`}
+                >
+                  {label}
+                </span>
+              </div>
+            );
+          })}
         </div>
       </section>
     </div>

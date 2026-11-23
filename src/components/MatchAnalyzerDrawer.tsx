@@ -18,13 +18,27 @@ import {
 import { ScoreMatrixHeatmap } from './charts/SimpleCharts';
 import { MissingDataNotice } from './ui/DataSourceBanner';
 
+export interface PredictionSnapshotPayload {
+  matchId: string;
+  confidenceTier: ConfidenceTier;
+  dataCompletenessScore: number;
+  expectedScore: string;
+  modelOutputs: unknown;
+  markets: unknown;
+  scoreMatrix: unknown;
+  selectedMarket: string;
+  selectedSelection: string;
+  predictedProb: number;
+  oddsAtPrediction: number;
+}
+
 interface MatchAnalyzerDrawerProps {
   match: MatchRecord | null;
   homeTeam?: TeamStatisticalProfile;
   awayTeam?: TeamStatisticalProfile;
   weights: EnsembleWeights;
   onClose: () => void;
-  onSavePrediction: (item: PredictionHistoryItem) => void;
+  onSavePrediction: (item: PredictionHistoryItem, payload: PredictionSnapshotPayload) => void | Promise<void>;
 }
 
 export const CONFIDENCE_LABELS: Record<ConfidenceTier, { label: string; colorClass: string }> = {
@@ -87,8 +101,17 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
   const confMeta = CONFIDENCE_LABELS[match.confidenceTier];
   const topScore = analysis.topScores[0];
 
-  const handleLogPreMatch = () => {
-    const odds = match.odds1X2?.home ?? 2.0;
+  const handleLogPreMatch = async () => {
+    const isHomeTop = analysis.dynamicEnsemble.home >= analysis.dynamicEnsemble.away;
+    const selection = isHomeTop
+      ? `Local (${match.homeTeamName})`
+      : `Visitante (${match.awayTeamName})`;
+    const predictedProb = Math.max(analysis.dynamicEnsemble.home, analysis.dynamicEnsemble.away);
+    const oddsUsed = isHomeTop
+      ? (match.odds1X2?.home ?? 2.0)
+      : (match.odds1X2?.away ?? 2.0);
+    const expectedScore = topScore ? `${topScore.homeGoals}-${topScore.awayGoals}` : '1-1';
+
     const item: PredictionHistoryItem = {
       id: `pred_${Date.now()}`,
       recordedAtUtc: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
@@ -96,17 +119,11 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
       leagueId: match.leagueId,
       matchLabel: `${match.homeTeamName} vs ${match.awayTeamName}`,
       market: 'Resultado 1X2',
-      selection:
-        analysis.dynamicEnsemble.home >= analysis.dynamicEnsemble.away
-          ? `Local (${match.homeTeamName})`
-          : `Visitante (${match.awayTeamName})`,
-      predictedProb: Math.max(analysis.dynamicEnsemble.home, analysis.dynamicEnsemble.away),
-      oddsAtPrediction:
-        analysis.dynamicEnsemble.home >= analysis.dynamicEnsemble.away
-          ? odds
-          : (match.odds1X2?.away ?? 2.0),
-      expectedScore: topScore ? `${topScore.homeGoals}-${topScore.awayGoals}` : '1-1',
-      modelVersion: 'ensemble-preview-p2',
+      selection,
+      predictedProb,
+      oddsAtPrediction: oddsUsed,
+      expectedScore,
+      modelVersion: match.isSynthetic ? 'ensemble-preview-p2' : 'ensemble-v1-phase3',
       confidenceTier: match.confidenceTier,
       status: 'pendiente',
       actualResult: null,
@@ -115,7 +132,25 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
       simulatedRoiUnit: null,
       isSynthetic: match.isSynthetic,
     };
-    onSavePrediction(item);
+
+    const payload: PredictionSnapshotPayload = {
+      matchId: match.id,
+      confidenceTier: match.confidenceTier,
+      dataCompletenessScore: match.dataCompleteness,
+      expectedScore,
+      modelOutputs: {
+        ...match.models,
+        dynamicEnsemble: analysis.dynamicEnsemble,
+      },
+      markets: analysis.markets,
+      scoreMatrix: analysis.topScores,
+      selectedMarket: 'Resultado 1X2',
+      selectedSelection: selection,
+      predictedProb,
+      oddsAtPrediction: oddsUsed,
+    };
+
+    await onSavePrediction(item, payload);
     setSavedNotice(true);
     setTimeout(() => setSavedNotice(false), 3000);
   };

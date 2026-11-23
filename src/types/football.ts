@@ -7,7 +7,25 @@ export type LeagueId =
 
 export type LeagueFilter = LeagueId | 'all';
 
-export type DataSourceMode = 'none' | 'sandbox' | 'csv';
+export type DataSourceMode = 'database' | 'none' | 'sandbox' | 'csv';
+
+export interface DbStatusSummary {
+  configured: boolean;
+  supabaseConfigured: boolean;
+  connected: boolean;
+  schemaReady: boolean;
+  error: string | null;
+  counts: {
+    leagues: number;
+    seasons: number;
+    teams: number;
+    matches: number;
+    predictions: number;
+  };
+  lastImportAt: string | null;
+  lastImportFilename: string | null;
+  lastPredictionAt: string | null;
+}
 
 export type ConfidenceTier = 'A' | 'B' | 'C' | 'DESCARTADO';
 
