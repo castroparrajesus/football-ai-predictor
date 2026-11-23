@@ -39,6 +39,7 @@ export type NavSectionId =
   | 'model_comparator'
   | 'history'
   | 'performance'
+  | 'monitoring'
   | 'settings';
 
 export interface LeagueInfo {
@@ -143,8 +144,15 @@ export interface ThreeWayProbabilities {
   away: number; // 0..1
 }
 
+export interface PredictionFactor {
+  label: string;
+  value: string;
+  impact: 'home' | 'away' | 'neutral';
+}
+
 export interface ModelBreakdown {
   poisson: ThreeWayProbabilities;
+  dixonColes?: ThreeWayProbabilities;
   elo: ThreeWayProbabilities;
   machineLearning: ThreeWayProbabilities;
   recentForm: ThreeWayProbabilities;
@@ -226,6 +234,10 @@ export interface ValueOpportunity {
   confidenceTier: ConfidenceTier;
   hasStatisticalValue: boolean;
   rejectionReason?: string;
+  bookmaker?: string;
+  oddsCapturedAt?: string | null;
+  isExpiredOdds?: boolean;
+  kickoffUtc?: string;
 }
 
 export interface MatchRecord {
@@ -233,6 +245,7 @@ export interface MatchRecord {
   leagueId: LeagueId;
   date: string; // YYYY-MM-DD
   kickoffTime: string; // HH:mm
+  kickoffUtc?: string;
   matchday: number;
   homeTeamId: string;
   awayTeamId: string;
@@ -250,6 +263,19 @@ export interface MatchRecord {
   } | null;
   expectedLambdaHome: number;
   expectedLambdaAway: number;
+  dixonColesRho?: number;
+  homeElo?: number;
+  awayElo?: number;
+  confidenceInterval90?: {
+    home: [number, number];
+    draw: [number, number];
+    away: [number, number];
+  };
+  keyFactors?: PredictionFactor[];
+  smallSampleWarning?: string | null;
+  matchStatus?: string;
+  actualScore?: string;
+  oddsCapturedAt?: string | null;
   odds1X2: MarketOdds1X2 | null;
   extraOdds: ExtraMarketOdds | null;
   models: ModelBreakdown;
@@ -299,3 +325,392 @@ export interface QualityFilterThresholds {
   minExpectedValuePct: number;
   strictModeNoForce: boolean;
 }
+
+export type ProviderId = 'football_data' | 'api_football' | 'the_odds_api';
+
+export interface ProviderCapabilities {
+  id: ProviderId;
+  name: string;
+  baseUrl: string;
+  pricingSummary: string;
+  rateLimitSummary: string;
+  termsNote: string;
+  supportsSchedules: boolean;
+  supportsHistoricalResults: boolean;
+  supportsStandings: boolean;
+  supportsTeamStats: boolean;
+  supportsXg: boolean;
+  supportsOdds: boolean;
+}
+
+export interface ProviderStatusInfo {
+  id: ProviderId;
+  name: string;
+  configured: boolean;
+  envVarName: string;
+  capabilities: ProviderCapabilities;
+  quotaRemaining: string | null;
+  lastSyncedAt: string | null;
+}
+
+export interface SyncLogEntry {
+  id: number;
+  providerId: string;
+  leagueId: string | null;
+  status: 'success' | 'partial' | 'error';
+  matchesUpserted: number;
+  teamsUpserted: number;
+  oddsInserted: number;
+  requestsUsed: number;
+  quotaRemaining: string | null;
+  warnings: string[];
+  errorMessage: string | null;
+  syncedAt: string;
+}
+
+export interface SyncExecutionSummary {
+  provider: ProviderId;
+  leaguesSynced: LeagueId[];
+  teamsUpserted: number;
+  matchesUpserted: number;
+  oddsInserted: number;
+  requestsUsed: number;
+  quotaRemaining: string | null;
+  warnings: string[];
+}
+
+export interface DataAuditReport {
+  generatedAtUtc: string;
+  totals: {
+    matches: number;
+    teams: number;
+    finishedMatches: number;
+    finishedWithResults: number;
+    scheduledMatches: number;
+    duplicateFixtureGroups: number;
+    potentialDuplicateTeamGroups: number;
+    dateRangeMinUtc: string | null;
+    dateRangeMaxUtc: string | null;
+  };
+  oddsAudit: {
+    totalOddsRows: number;
+    matchesWithOdds: number;
+    upcomingMatchesWithOdds: number;
+    finishedMatchesWithOdds: number;
+    expiredOddsRows: number;
+    markets: string[];
+    bookmakers: string[];
+  };
+  coverage: {
+    teamSeasonStatsRows: number;
+    teamMatchStatsRows: number;
+    xgRows: number;
+    lineupRows: number;
+    injuryRows: number;
+  };
+  byLeague: {
+    leagueId: string;
+    total: number;
+    finished: number;
+    scheduled: number;
+    withOdds: number;
+  }[];
+  bySeason: {
+    seasonId: string;
+    total: number;
+    finished: number;
+    scheduled: number;
+  }[];
+  byStatus: {
+    status: string;
+    count: number;
+  }[];
+  missingDataGaps: string[];
+}
+
+export interface BacktestModelMetric {
+  modelKey: string;
+  modelLabel: string;
+  sampleCount: number;
+  accuracyPct: number;
+  accuracyCi95?: [number, number];
+  brierScore: number;
+  brierCi95?: [number, number];
+  logLoss: number;
+  logLossCi95?: [number, number];
+  ece: number;
+}
+
+export interface BacktestLeagueMetric {
+  leagueId: string;
+  matchesEvaluated: number;
+  accuracyPct: number;
+  accuracyCi95?: [number, number];
+  brierScore: number;
+  brierCi95?: [number, number];
+  logLoss: number;
+  logLossCi95?: [number, number];
+}
+
+export interface BacktestFoldSummary {
+  foldIndex: number;
+  startDate: string;
+  endDate: string;
+  trainMatchCount?: number;
+  trainMlSamplesBeforeFold?: number;
+  trainEndDate?: string;
+  matchesEvaluated: number;
+  accuracyPct: number;
+  accuracyCi95?: [number, number];
+  brierScore: number;
+  logLoss: number;
+  rhoFitted: number;
+}
+
+export interface BacktestDatasetAudit {
+  totalChronologicalFinished: number;
+  warmupMatches: number;
+  warmupEligibleMlSamples: number;
+  warmupSkippedColdStart: number;
+  evaluatedMatches: number;
+  evalEligibleMlSamples: number;
+  evalSkippedColdStart: number;
+  finalLiveRefitSamples: number;
+  overlapCount: number;
+  chronologicalOrderVerified: boolean;
+  leakageAuditPassed: boolean;
+  explanation: string;
+}
+
+export interface BacktestRunSummary {
+  runId: string;
+  createdAtUtc: string;
+  cutoffUtc?: string;
+  leagueFilter: LeagueFilter;
+  seasonFilter: string;
+  calibrationMethod: 'platt' | 'isotonic' | 'none';
+  weightsUsed?: EnsembleWeights;
+  warmupMatches: number;
+  evaluatedMatches: number;
+  dateRangeStart: string;
+  dateRangeEnd: string;
+  fittedRho: number;
+  mlTrainedSamples: number;
+  ece: number;
+  datasetAudit?: BacktestDatasetAudit;
+  oddsCoverage: {
+    matchesWithHistoricalOdds: number;
+    valueBetsSimulated: number;
+    roiPct: number | null;
+    yieldUnits: number | null;
+    note?: string;
+  };
+  modelMetrics: BacktestModelMetric[];
+  byLeague: BacktestLeagueMetric[];
+  bySeason: {
+    seasonId: string;
+    matchesEvaluated: number;
+    accuracyPct: number;
+    accuracyCi95?: [number, number];
+    brierScore: number;
+    logLoss: number;
+  }[];
+  calibrationBins: CalibrationBin[];
+  folds: BacktestFoldSummary[];
+}
+
+export interface BacktestReproductionResult {
+  originalRunId: string;
+  originalSummary: BacktestRunSummary;
+  reproducedSummary: BacktestRunSummary;
+  reproducibilityCheck: {
+    identicalMatchCount: boolean;
+    brierDiff: number;
+    logLossDiff: number;
+    accuracyDiff: number;
+    eceDiff: number;
+    exactMatch: boolean;
+  };
+}
+
+export interface ActiveTrainedModelInfo {
+  id: string;
+  name: string;
+  weights: EnsembleWeights;
+  calibrationMethod: string;
+  trainedUntilUtc: string | null;
+  rho: number;
+  mlTrainedSamples: number;
+  evalMetrics: {
+    brierScore?: number;
+    logLoss?: number;
+    accuracyPct?: number;
+    ece?: number;
+    evaluatedMatches?: number;
+  } | null;
+}
+
+export interface DetectedValueOpportunityRecord {
+  id: string;
+  matchId: string;
+  matchLabel: string;
+  leagueId: LeagueId;
+  kickoffUtc: string;
+  modelVersionId: string;
+  market: string;
+  selection: string;
+  bookmaker: string;
+  modelProb: number;
+  decimalOdds: number;
+  openingOdds?: number | null;
+  closingOdds?: number | null;
+  clvPct?: number | null;
+  impliedProbRaw: number;
+  impliedProbDevig: number | null;
+  fairOdds: number;
+  edgePp: number;
+  expectedValue: number;
+  confidenceTier: ConfidenceTier;
+  oddsCapturedAt: string;
+  status: 'pendiente' | 'ganada' | 'perdida' | 'anulada';
+  actualResult: string | null;
+  realizedRoiUnit: number | null;
+  createdAt: string;
+  settledAt: string | null;
+}
+
+export interface ProviderEnrichmentEvaluation {
+  id: string;
+  name: string;
+  status: 'configurado' | 'evaluado_no_contratado' | 'descartado_tos';
+  pricingSummary: string;
+  big5Coverage: string;
+  historicalAvailability: string;
+  rateLimits: string;
+  termsSummary: string;
+  supports: {
+    xg: boolean;
+    shots: boolean;
+    corners: boolean;
+    cards: boolean;
+    lineups: boolean;
+    injuries: boolean;
+    homeAwaySplits: boolean;
+    closingOdds: boolean;
+  };
+  recommendedRole: string;
+}
+
+export interface OddsSnapshotPoint {
+  id: number;
+  decimalOdds: number;
+  capturedAt: string;
+  minutesToKickoff: number | null;
+  isClosing: boolean;
+}
+
+export interface OddsHistoryTimeline {
+  matchId: string;
+  matchLabel: string;
+  leagueId: LeagueId;
+  kickoffUtc: string;
+  matchStatus: string;
+  bookmaker: string;
+  market: string;
+  selection: string;
+  openingOdds: number;
+  openingCapturedAt: string;
+  latestOdds: number;
+  latestCapturedAt: string;
+  closingOdds: number | null;
+  closingCapturedAt: string | null;
+  deltaOdds: number;
+  deltaPct: number;
+  snapshotCount: number;
+  linkedOpportunitiesCount: number;
+  snapshots: OddsSnapshotPoint[];
+}
+
+export interface SystemAlert {
+  id: string;
+  severity: 'info' | 'warning' | 'critical';
+  category: 'degradacion' | 'cuotas_caducadas' | 'mercado_bloqueado' | 'validacion_modelo' | 'cobertura_datos';
+  title: string;
+  detail: string;
+  actionHint?: string;
+}
+
+export interface PerformanceBreakdownRow {
+  groupKey: string;
+  groupLabel: string;
+  totalPredictions: number;
+  settledCount: number;
+  pendingCount: number;
+  wins: number;
+  hitRatePct: number | null;
+  hitRateCi95: [number, number] | null;
+  brierScore: number | null;
+  logLoss: number | null;
+  ece: number | null;
+  realizedRoiPct: number | null;
+  realizedYieldUnits: number | null;
+  clvAvgPct: number | null;
+  clvSampleCount: number;
+}
+
+export interface MonitoringConfigState {
+  autoOddsCaptureEnabled: boolean;
+  captureIntervalMinutes: number;
+  closingWindowMinutes: number;
+  minRemainingCreditsGuard: number;
+  autoSettleEnabled: boolean;
+  lastAutoOddsRunAt: string | null;
+  lastAutoSettleRunAt: string | null;
+}
+
+export interface MonitoringDashboardData {
+  generatedAtUtc: string;
+  config: MonitoringConfigState;
+  alerts: SystemAlert[];
+  blockedMarkets: {
+    market: string;
+    reason: string;
+    currentRows: number;
+    requiredMinimum: string;
+  }[];
+  modelValidationStatus: {
+    isValidated: boolean;
+    statusLabel: string;
+    reasons: string[];
+    byLeague: {
+      leagueId: LeagueId;
+      evaluatedMatches: number;
+      logLoss: number | null;
+      status: 'validado' | 'muestra_pequena' | 'alerta_degradacion' | 'sin_evaluar';
+    }[];
+  };
+  liveRealMetrics: {
+    totalPredictionsLogged: number;
+    pendingCount: number;
+    settledCount: number;
+    wins: number;
+    losses: number;
+    hitRatePct: number | null;
+    hitRateCi95: [number, number] | null;
+    brierScore: number | null;
+    logLoss: number | null;
+    ece: number | null;
+    realizedRoiPct: number | null;
+    realizedYieldUnits: number | null;
+    clvAvgPct: number | null;
+    clvSampleCount: number;
+    profitabilityDisclaimer: string;
+    byLeague: PerformanceBreakdownRow[];
+    byMarket: PerformanceBreakdownRow[];
+    bySeason: PerformanceBreakdownRow[];
+    byModel: PerformanceBreakdownRow[];
+  };
+  providerEvaluations: ProviderEnrichmentEvaluation[];
+}
+
+

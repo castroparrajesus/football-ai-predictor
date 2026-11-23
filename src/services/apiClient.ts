@@ -1,12 +1,25 @@
 import {
+  ActiveTrainedModelInfo,
+  BacktestReproductionResult,
+  BacktestRunSummary,
   CalibrationBin,
   ConfidenceTier,
+  DataAuditReport,
   DbStatusSummary,
+  DetectedValueOpportunityRecord,
   EnsembleWeights,
+  LeagueFilter,
   LeagueInfo,
   MatchRecord,
+  MonitoringConfigState,
+  MonitoringDashboardData,
+  OddsHistoryTimeline,
   PredictionHistoryItem,
+  ProviderId,
+  ProviderStatusInfo,
   QualityFilterThresholds,
+  SyncExecutionSummary,
+  SyncLogEntry,
   TeamStatisticalProfile,
 } from '../types/football';
 import type { ParsedCsvRowForDb } from '../utils/csvImporter';
@@ -121,5 +134,129 @@ export const apiClient = {
     requestJson<void>('/api/model-config', {
       method: 'PUT',
       body: JSON.stringify({ weights, thresholds }),
+    }),
+
+  getProvidersStatus: () =>
+    requestJson<{
+      providers: ProviderStatusInfo[];
+      recentLogs: SyncLogEntry[];
+    }>('/api/providers/status'),
+
+  runProviderSync: (payload: {
+    provider: ProviderId;
+    leagueId: LeagueFilter;
+    seasonYear?: number;
+    includeOdds?: boolean;
+  }) =>
+    requestJson<SyncExecutionSummary>('/api/sync/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getAuditReport: () => requestJson<DataAuditReport>('/api/audit'),
+
+  getBacktestHistory: () => requestJson<BacktestRunSummary[]>('/api/backtest/history'),
+
+  runBacktest: (payload: {
+    leagueId: LeagueFilter;
+    seasonId?: string;
+    calibrationMethod: 'platt' | 'isotonic' | 'none';
+    trainAndActivate: boolean;
+  }) =>
+    requestJson<BacktestRunSummary>('/api/backtest/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getActiveTrainedModel: () => requestJson<ActiveTrainedModelInfo | null>('/api/model/active'),
+
+  getValueOpportunities: (leagueId?: string) => {
+    const qs = leagueId && leagueId !== 'all' ? `?league=${encodeURIComponent(leagueId)}` : '';
+    return requestJson<DetectedValueOpportunityRecord[]>(`/api/value-opportunities${qs}`);
+  },
+
+  saveValueOpportunity: (payload: {
+    matchId: string;
+    modelVersionId?: string;
+    market: string;
+    selection: string;
+    bookmaker: string;
+    modelProb: number;
+    decimalOdds: number;
+    impliedProbRaw: number;
+    impliedProbDevig: number | null;
+    fairOdds: number;
+    edgePp: number;
+    expectedValue: number;
+    confidenceTier: ConfidenceTier;
+    oddsCapturedAt?: string | null;
+  }) =>
+    requestJson<{ id: string }>('/api/value-opportunities', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  settleValueOpportunities: () =>
+    requestJson<{ settledCount: number }>('/api/value-opportunities/settle', {
+      method: 'POST',
+    }),
+
+  reproduceBacktest: (runId: string) =>
+    requestJson<BacktestReproductionResult>(
+      `/api/backtest/${encodeURIComponent(runId)}/reproduce`,
+      { method: 'POST' }
+    ),
+
+  getMonitoringDashboard: (leagueId?: string) => {
+    const qs = leagueId && leagueId !== 'all' ? `?league=${encodeURIComponent(leagueId)}` : '';
+    return requestJson<MonitoringDashboardData>(`/api/monitoring/dashboard${qs}`);
+  },
+
+  updateMonitoringConfig: (payload: Partial<MonitoringConfigState>) =>
+    requestJson<MonitoringConfigState>('/api/monitoring/config', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
+  getOddsHistory: (leagueId?: string, limit = 180) => {
+    const params = new URLSearchParams();
+    if (leagueId && leagueId !== 'all') params.set('league', leagueId);
+    params.set('limit', String(limit));
+    return requestJson<OddsHistoryTimeline[]>(`/api/odds/history?${params.toString()}`);
+  },
+
+  captureOddsNow: (leagueId: LeagueFilter) =>
+    requestJson<{
+      executed: boolean;
+      skippedReason?: string;
+      oddsInserted: number;
+      requestsUsed: number;
+      quotaRemaining: string | null;
+    }>('/api/odds/capture-now', {
+      method: 'POST',
+      body: JSON.stringify({ leagueId }),
+    }),
+
+  captureUpcomingPredictions: (leagueId: LeagueFilter) =>
+    requestJson<{
+      registeredCount: number;
+      skippedExisting: number;
+      skippedDiscarded: number;
+      withMarketOddsCount: number;
+      withoutMarketOddsCount: number;
+      modelVersionId: string;
+    }>('/api/predictions/capture-upcoming', {
+      method: 'POST',
+      body: JSON.stringify({ leagueId }),
+    }),
+
+  autoSettlePending: () =>
+    requestJson<{
+      settledPredictions: number;
+      settledValueOpportunities: number;
+      skippedUnsupported: number;
+      ranAtUtc: string;
+    }>('/api/predictions/auto-settle', {
+      method: 'POST',
     }),
 };

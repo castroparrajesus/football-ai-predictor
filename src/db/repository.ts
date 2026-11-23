@@ -2,7 +2,9 @@ import { Pool } from 'pg';
 import {
   CalibrationBin,
   ConfidenceTier,
+  DetectedValueOpportunityRecord,
   EnsembleWeights,
+  LeagueFilter,
   LeagueId,
   MatchRecord,
   PredictionHistoryItem,
@@ -10,12 +12,19 @@ import {
   TeamStatisticalProfile,
 } from '../types/football.ts';
 import {
-  combineEnsembleProbabilities,
   computeBrierScoreBinary,
   computeLogLossBinary,
-  computePoissonScoreMatrix,
   removeBookmakerMargin,
 } from '../utils/previewMath.ts';
+import {
+  getActiveTrainedModelFromDb,
+  loadChronologicalMatches,
+} from '../services/engine/backtestService.ts';
+import { runMatchInference } from '../services/engine/liveInference.ts';
+import {
+  createChronoState,
+  updateChronoStateWithMatch,
+} from '../services/engine/models.ts';
 import { checkDatabaseConnection, getPool } from './pool.ts';
 
 function requirePool(): Pool {
@@ -234,9 +243,80 @@ export async function getTeamsFromDb(leagueId?: string): Promise<TeamStatistical
     byTeam.set(row.team_id, arr);
   }
 
-  return teamsRes.rows.map((team, idx) => {
+  interface SeasonStatRow {
+    team_id: string;
+    position: number | null;
+    points: number | null;
+    played: number;
+    won: number;
+    drawn: number;
+    lost: number;
+    goals_for: number;
+    goals_against: number;
+    xg: string | null;
+    xga: string | null;
+    home_played: number | null;
+    home_won: number | null;
+    home_drawn: number | null;
+    home_lost: number | null;
+    home_gf: number | null;
+    home_ga: number | null;
+    away_played: number | null;
+    away_won: number | null;
+    away_drawn: number | null;
+    away_lost: number | null;
+    away_gf: number | null;
+    away_ga: number | null;
+    form_string: string | null;
+  }
+
+  const seasonStatsByTeam = new Map<string, SeasonStatRow>();
+  try {
+    const seasonWhere = leagueId && leagueId !== 'all' ? 'WHERE tss.league_id = $1' : '';
+    const seasonRes = await pool.query<SeasonStatRow>(
+      `SELECT DISTINCT ON (tss.team_id)
+        tss.team_id, tss.position, tss.points, tss.played, tss.won, tss.drawn, tss.lost,
+        tss.goals_for, tss.goals_against, tss.xg, tss.xga,
+        tss.home_played, tss.home_won, tss.home_drawn, tss.home_lost, tss.home_gf, tss.home_ga,
+        tss.away_played, tss.away_won, tss.away_drawn, tss.away_lost, tss.away_gf, tss.away_ga,
+        tss.form_string
+       FROM team_season_stats tss
+       ${seasonWhere}
+       ORDER BY tss.team_id, tss.season_id DESC, tss.updated_at DESC`,
+      params
+    );
+    for (const row of seasonRes.rows) {
+      seasonStatsByTeam.set(row.team_id, row);
+    }
+  } catch {
+    // La tabla team_season_stats puede no existir antes de ejecutar la migración 0003
+  }
+
+  // Calcular Elo dinámico cronológico real desde resultados históricos
+  const chronoEloByTeam = new Map<string, number>();
+  const lastMatchMsByTeam = new Map<string, number>();
+  try {
+    const chronoMatches = await loadChronologicalMatches({
+      leagueFilter: (leagueId as LeagueFilter) || 'all',
+    });
+    const chronoState = createChronoState();
+    for (const cm of chronoMatches) {
+      updateChronoStateWithMatch(chronoState, cm);
+      lastMatchMsByTeam.set(cm.homeTeamId, cm.kickoffMs);
+      lastMatchMsByTeam.set(cm.awayTeamId, cm.kickoffMs);
+    }
+    for (const [tid, elo] of chronoState.eloByTeam.entries()) {
+      chronoEloByTeam.set(tid, Math.round(elo));
+    }
+  } catch {
+    // Fallback al rating almacenado en teams si aún no hay histórico suficiente
+  }
+
+  const nowMs = Date.now();
+  const profiles: TeamStatisticalProfile[] = teamsRes.rows.map((team, idx) => {
     const rows = byTeam.get(team.id) ?? [];
     const finished = rows.filter((r) => r.home_goals !== null && r.away_goals !== null);
+    const seasonStat = seasonStatsByTeam.get(team.id);
 
     let won = 0;
     let drawn = 0;
@@ -301,10 +381,41 @@ export async function getTeamsFromDb(leagueId?: string): Promise<TeamStatistical
       if (r.red_cards !== null) { rcSum += r.red_cards; rcCount += 1; }
     }
 
-    const played = finished.length;
-    const points = won * 3 + drawn;
+    const useSeasonStandings = Boolean(
+      seasonStat && seasonStat.played > 0 && seasonStat.played >= finished.length
+    );
+
+    const played = useSeasonStandings ? seasonStat!.played : finished.length;
+    const finalWon = useSeasonStandings ? seasonStat!.won : won;
+    const finalDrawn = useSeasonStandings ? seasonStat!.drawn : drawn;
+    const finalLost = useSeasonStandings ? seasonStat!.lost : lost;
+    const finalGf = useSeasonStandings ? seasonStat!.goals_for : gf;
+    const finalGa = useSeasonStandings ? seasonStat!.goals_against : ga;
+    const points =
+      useSeasonStandings && seasonStat!.points !== null
+        ? seasonStat!.points
+        : finalWon * 3 + finalDrawn;
+
+    if (useSeasonStandings && seasonStat!.home_played !== null) {
+      homeP = seasonStat!.home_played;
+      homeW = seasonStat!.home_won ?? 0;
+      homeD = seasonStat!.home_drawn ?? 0;
+      homeL = seasonStat!.home_lost ?? 0;
+      homeGF = seasonStat!.home_gf ?? 0;
+      homeGA = seasonStat!.home_ga ?? 0;
+    }
+    if (useSeasonStandings && seasonStat!.away_played !== null) {
+      awayP = seasonStat!.away_played;
+      awayW = seasonStat!.away_won ?? 0;
+      awayD = seasonStat!.away_drawn ?? 0;
+      awayL = seasonStat!.away_lost ?? 0;
+      awayGF = seasonStat!.away_gf ?? 0;
+      awayGA = seasonStat!.away_ga ?? 0;
+    }
+
+    const finishedCount = finished.length;
     const last5Rows = finished.slice(0, 5);
-    const l5 = last5Rows.reduce(
+    let l5 = last5Rows.reduce(
       (acc, r) => {
         const tg = r.is_home ? r.home_goals! : r.away_goals!;
         const og = r.is_home ? r.away_goals! : r.home_goals!;
@@ -319,8 +430,35 @@ export async function getTeamsFromDb(leagueId?: string): Promise<TeamStatistical
       { matches: 0, wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0, points: 0 }
     );
 
+    if (l5.matches === 0 && seasonStat?.form_string) {
+      const tokens = seasonStat.form_string
+        .replace(/,/g, '')
+        .trim()
+        .toUpperCase()
+        .slice(-5)
+        .split('');
+      for (const ch of tokens) {
+        if (ch === 'W') { l5.matches += 1; l5.wins += 1; l5.points += 3; }
+        else if (ch === 'D') { l5.matches += 1; l5.draws += 1; l5.points += 1; }
+        else if (ch === 'L') { l5.matches += 1; l5.losses += 1; }
+      }
+    }
+
+    const resolvedXg =
+      xgCount > 0
+        ? Number(xgSum.toFixed(2))
+        : seasonStat?.xg !== null && seasonStat?.xg !== undefined
+        ? Number(seasonStat.xg)
+        : null;
+    const resolvedXga =
+      xgaCount > 0
+        ? Number(xgaSum.toFixed(2))
+        : seasonStat?.xga !== null && seasonStat?.xga !== undefined
+        ? Number(seasonStat.xga)
+        : null;
+
     const missingFields: string[] = [];
-    if (xgCount === 0) missingFields.push('xG / xGA');
+    if (resolvedXg === null) missingFields.push('xG / xGA');
     if (shotsCount === 0) missingFields.push('Tiros totales / a puerta');
     if (cornersCount === 0) missingFields.push('Córners promedio');
     if (ycCount === 0) missingFields.push('Tarjetas promedio');
@@ -331,29 +469,29 @@ export async function getTeamsFromDb(leagueId?: string): Promise<TeamStatistical
       leagueId: team.league_id,
       name: team.name,
       shortName: team.short_name,
-      position: idx + 1,
+      position: seasonStat?.position ?? idx + 1,
       points,
       played,
-      won,
-      drawn,
-      lost,
-      goalsFor: gf,
-      goalsAgainst: ga,
-      avgGoalsFor: played > 0 ? Number((gf / played).toFixed(2)) : 0,
-      avgGoalsAgainst: played > 0 ? Number((ga / played).toFixed(2)) : 0,
-      xg: xgCount > 0 ? Number(xgSum.toFixed(2)) : null,
-      xga: xgaCount > 0 ? Number(xgaSum.toFixed(2)) : null,
+      won: finalWon,
+      drawn: finalDrawn,
+      lost: finalLost,
+      goalsFor: finalGf,
+      goalsAgainst: finalGa,
+      avgGoalsFor: played > 0 ? Number((finalGf / played).toFixed(2)) : 0,
+      avgGoalsAgainst: played > 0 ? Number((finalGa / played).toFixed(2)) : 0,
+      xg: resolvedXg,
+      xga: resolvedXga,
       totalShots: shotsCount > 0 ? shotsSum : null,
       shotsOnTarget: sotCount > 0 ? sotSum : null,
       offensiveEfficiency:
-        sotCount > 0 && sotSum > 0 ? Number(((gf / sotSum) * 100).toFixed(1)) : null,
+        sotCount > 0 && sotSum > 0 ? Number(((finalGf / sotSum) * 100).toFixed(1)) : null,
       defensiveEfficiency: null,
       cleanSheets,
-      bttsRate: played > 0 ? Number((bttsCount / played).toFixed(2)) : 0,
-      over15Rate: played > 0 ? Number((o15 / played).toFixed(2)) : 0,
-      over25Rate: played > 0 ? Number((o25 / played).toFixed(2)) : 0,
-      over35Rate: played > 0 ? Number((o35 / played).toFixed(2)) : 0,
-      over45Rate: played > 0 ? Number((o45 / played).toFixed(2)) : 0,
+      bttsRate: finishedCount > 0 ? Number((bttsCount / finishedCount).toFixed(2)) : 0,
+      over15Rate: finishedCount > 0 ? Number((o15 / finishedCount).toFixed(2)) : 0,
+      over25Rate: finishedCount > 0 ? Number((o25 / finishedCount).toFixed(2)) : 0,
+      over35Rate: finishedCount > 0 ? Number((o35 / finishedCount).toFixed(2)) : 0,
+      over45Rate: finishedCount > 0 ? Number((o45 / finishedCount).toFixed(2)) : 0,
       cornersForAvg: cornersCount > 0 ? Number((cornersSum / cornersCount).toFixed(2)) : null,
       cornersAgainstAvg: null,
       yellowCardsAvg: ycCount > 0 ? Number((ycSum / ycCount).toFixed(2)) : null,
@@ -382,15 +520,27 @@ export async function getTeamsFromDb(leagueId?: string): Promise<TeamStatistical
       last10: null,
       last15: null,
       vsSimilarLevelPPG: null,
-      restDays: null,
+      restDays: (() => {
+        const lastMs = lastMatchMsByTeam.get(team.id);
+        if (!lastMs) return null;
+        const diffDays = Math.round((nowMs - lastMs) / 86_400_000);
+        return diffDays >= 0 && diffDays <= 45 ? diffDays : null;
+      })(),
       scheduleCongestion: null,
       absences: null,
       probableLineup: null,
       recentCoachChange: false,
       recentTrend: l5.points >= 10 ? 'ascendente' : l5.points <= 4 && l5.matches >= 3 ? 'descendente' : 'estable',
-      eloRating: Number(team.elo_rating),
+      eloRating: chronoEloByTeam.get(team.id) ?? Number(team.elo_rating),
       missingFields,
     };
+  });
+
+  return profiles.sort((a, b) => {
+    if (a.leagueId !== b.leagueId) return a.leagueId.localeCompare(b.leagueId);
+    if (a.points !== b.points) return b.points - a.points;
+    if (a.position !== b.position) return a.position - b.position;
+    return b.goalsFor - b.goalsAgainst - (a.goalsFor - a.goalsAgainst);
   });
 }
 
@@ -458,15 +608,26 @@ export async function getMatchesFromDb(filters?: {
     JOIN teams at ON at.id = m.away_team_id
     LEFT JOIN match_results mr ON mr.match_id = m.id
     ${whereSql}
-    ORDER BY m.kickoff_utc DESC
-    LIMIT 200`,
+    ORDER BY
+      CASE WHEN m.status IN ('live', 'scheduled') THEN 0 ELSE 1 END ASC,
+      CASE WHEN m.status IN ('live', 'scheduled') THEN m.kickoff_utc END ASC,
+      m.kickoff_utc DESC
+    LIMIT 450`,
     params
   );
 
   const matchIds = res.rows.map((r) => r.id);
   const oddsMap = new Map<
     string,
-    { home?: number; draw?: number; away?: number; over25?: number; under25?: number; bookmaker: string }
+    {
+      home?: number;
+      draw?: number;
+      away?: number;
+      over25?: number;
+      under25?: number;
+      bookmaker: string;
+      capturedAt?: string;
+    }
   >();
 
   if (matchIds.length > 0) {
@@ -476,8 +637,9 @@ export async function getMatchesFromDb(filters?: {
       market: string;
       selection: string;
       decimal_odds: string;
+      captured_at: Date;
     }>(
-      `SELECT match_id, bookmaker, market, selection, decimal_odds
+      `SELECT match_id, bookmaker, market, selection, decimal_odds, captured_at
        FROM odds_snapshots
        WHERE match_id = ANY($1::text[])
        ORDER BY captured_at DESC`,
@@ -485,7 +647,10 @@ export async function getMatchesFromDb(filters?: {
     );
 
     for (const o of oddsRes.rows) {
-      const entry = oddsMap.get(o.match_id) ?? { bookmaker: o.bookmaker };
+      const entry = oddsMap.get(o.match_id) ?? {
+        bookmaker: o.bookmaker,
+        capturedAt: new Date(o.captured_at).toISOString(),
+      };
       const val = Number(o.decimal_odds);
       if (o.market === '1X2') {
         if (o.selection === '1' && entry.home === undefined) entry.home = val;
@@ -499,14 +664,103 @@ export async function getMatchesFromDb(filters?: {
     }
   }
 
+  // Cargar modelo activo entrenado + historial cronológico para inferencia estrictamente pre-partido (zero leakage)
+  const [activeModel, chronoMatches] = await Promise.all([
+    getActiveTrainedModelFromDb(),
+    loadChronologicalMatches().catch(() => []),
+  ]);
+
+  const defaultWeights: EnsembleWeights = activeModel?.weights ?? {
+    poisson: 0.28,
+    elo: 0.24,
+    machineLearning: 0.24,
+    recentForm: 0.12,
+    homeAway: 0.12,
+  };
+
+  // Ordenar filas cronológicamente en un paso auxiliar para avanzar ChronoState sin data leakage
+  const rowsChrono = [...res.rows].sort(
+    (a, b) => new Date(a.kickoff_utc).getTime() - new Date(b.kickoff_utc).getTime()
+  );
+  const inferenceById = new Map<
+    string,
+    {
+      inf: ReturnType<typeof runMatchInference>;
+      h2h: { matches: number; homeWins: number; draws: number; awayWins: number; avgGoals: number } | null;
+    }
+  >();
+
+  const chronoState = createChronoState();
+  let ptr = 0;
+  for (const row of rowsChrono) {
+    const rowMs = new Date(row.kickoff_utc).getTime();
+    while (ptr < chronoMatches.length && chronoMatches[ptr].kickoffMs < rowMs) {
+      updateChronoStateWithMatch(chronoState, chronoMatches[ptr]);
+      ptr += 1;
+    }
+
+    const odds = oddsMap.get(row.id);
+    const hasOdds = Boolean(odds?.home && odds?.draw && odds?.away);
+    const inf = runMatchInference({
+      state: chronoState,
+      leagueId: row.league_id,
+      homeTeamId: row.home_team_id,
+      awayTeamId: row.away_team_id,
+      kickoffMs: rowMs,
+      hasOdds,
+      weights: defaultWeights,
+      rho: activeModel?.rho,
+      mlModel: activeModel?.mlModel,
+      calibrator: activeModel?.calibrator,
+    });
+
+    // H2H estrictamente previo al kickoff
+    const h2hMatches = chronoMatches
+      .slice(0, ptr)
+      .filter(
+        (cm) =>
+          (cm.homeTeamId === row.home_team_id && cm.awayTeamId === row.away_team_id) ||
+          (cm.homeTeamId === row.away_team_id && cm.awayTeamId === row.home_team_id)
+      )
+      .slice(-8);
+
+    let h2h: { matches: number; homeWins: number; draws: number; awayWins: number; avgGoals: number } | null = null;
+    if (h2hMatches.length > 0) {
+      let hw = 0;
+      let dr = 0;
+      let aw = 0;
+      let goals = 0;
+      for (const hm of h2hMatches) {
+        goals += hm.homeGoals + hm.awayGoals;
+        if (hm.homeGoals === hm.awayGoals) dr += 1;
+        else if (
+          (hm.homeTeamId === row.home_team_id && hm.homeGoals > hm.awayGoals) ||
+          (hm.awayTeamId === row.home_team_id && hm.awayGoals > hm.homeGoals)
+        ) {
+          hw += 1;
+        } else {
+          aw += 1;
+        }
+      }
+      h2h = {
+        matches: h2hMatches.length,
+        homeWins: hw,
+        draws: dr,
+        awayWins: aw,
+        avgGoals: Number((goals / h2hMatches.length).toFixed(2)),
+      };
+    }
+
+    inferenceById.set(row.id, { inf, h2h });
+  }
+
   return res.rows.map((row) => {
     const iso = new Date(row.kickoff_utc).toISOString();
     const datePart = iso.slice(0, 10);
     const timePart = iso.slice(11, 16);
-    const lambdaHome = row.expected_lambda_home ? Number(row.expected_lambda_home) : 1.45;
-    const lambdaAway = row.expected_lambda_away ? Number(row.expected_lambda_away) : 1.15;
-    const poisson = computePoissonScoreMatrix(lambdaHome, lambdaAway).threeWay;
 
+    const computed = inferenceById.get(row.id)!;
+    const inf = computed.inf;
     const odds = oddsMap.get(row.id);
     const has1X2 = Boolean(odds?.home && odds?.draw && odds?.away);
     const deVigged = has1X2
@@ -517,26 +771,40 @@ export async function getMatchesFromDb(filters?: {
       ? (row.missing_data_notes as string[])
       : [];
 
-    const completeness = row.data_completeness;
-    const confidenceTier: ConfidenceTier =
-      completeness >= 85 ? 'A' : completeness >= 70 ? 'B' : completeness >= 45 ? 'C' : 'DESCARTADO';
-
-    const ensemble = combineEnsembleProbabilities(
-      {
-        poisson,
-        elo: poisson,
-        machineLearning: poisson,
-        recentForm: poisson,
-        homeAway: poisson,
-      },
-      { poisson: 0.25, elo: 0.22, machineLearning: 0.25, recentForm: 0.14, homeAway: 0.14 }
+    const completeness = Math.min(
+      85,
+      Math.max(row.data_completeness, inf.suggestedCompletenessBoost)
     );
+    const confidenceTier: ConfidenceTier =
+      row.data_completeness < 40 ? 'DESCARTADO' : inf.suggestedTier;
+
+    const confidenceReasons: string[] = [];
+    if (inf.smallSampleWarning) {
+      confidenceReasons.push(inf.smallSampleWarning);
+    } else {
+      confidenceReasons.push(
+        `Histórico pre-partido verificado (${inf.homePlayed} vs ${inf.awayPlayed} partidos) con Elo ${inf.homeElo} vs ${inf.awayElo}.`
+      );
+    }
+    if (activeModel) {
+      confidenceReasons.push(
+        `Motor ${activeModel.name} (ρ=${inf.dixonColesRho}, ML n=${activeModel.mlModel.trainedSamples}, cal=${activeModel.calibrationMethod}).`
+      );
+    } else {
+      confidenceReasons.push(
+        'Ejecutando Poisson + Dixon-Coles + Elo + Estadísticas pre-partido (ejecuta Backtest Walk-Forward para calibrar ML/Platt).'
+      );
+    }
+    if (!has1X2) {
+      confidenceReasons.push('Sin cuotas 1X2 vigentes vinculadas para este encuentro.');
+    }
 
     return {
       id: row.id,
       leagueId: row.league_id,
       date: datePart,
       kickoffTime: timePart,
+      kickoffUtc: iso,
       matchday: row.matchday,
       homeTeamId: row.home_team_id,
       awayTeamId: row.away_team_id,
@@ -545,9 +813,16 @@ export async function getMatchesFromDb(filters?: {
       isSynthetic: false,
       dataCompleteness: completeness,
       missingDataNotes: missingNotes,
-      h2hSummary: null,
-      expectedLambdaHome: lambdaHome,
-      expectedLambdaAway: lambdaAway,
+      h2hSummary: computed.h2h,
+      expectedLambdaHome: inf.lambdaHome,
+      expectedLambdaAway: inf.lambdaAway,
+      dixonColesRho: inf.dixonColesRho,
+      homeElo: inf.homeElo,
+      awayElo: inf.awayElo,
+      confidenceInterval90: inf.confidenceInterval90,
+      keyFactors: inf.keyFactors,
+      smallSampleWarning: inf.smallSampleWarning,
+      oddsCapturedAt: odds?.capturedAt ?? null,
       odds1X2: has1X2
         ? {
             home: odds!.home!,
@@ -561,27 +836,24 @@ export async function getMatchesFromDb(filters?: {
           ? { over25: odds.over25, under25: odds.under25 }
           : null,
       models: {
-        poisson,
-        elo: poisson,
-        machineLearning: poisson,
-        recentForm: poisson,
-        homeAway: poisson,
+        poisson: inf.poisson,
+        dixonColes: inf.dixonColes,
+        elo: inf.elo,
+        machineLearning: inf.machineLearning,
+        recentForm: inf.statsOffDef,
+        homeAway: inf.statsOffDef,
         marketDeVigged: deVigged
           ? { home: deVigged[0], draw: deVigged[1], away: deVigged[2] }
           : null,
-        ensemble,
-        modelSpread: 0,
+        ensemble: inf.ensemble,
+        modelSpread: inf.modelSpread,
       },
       confidenceTier,
-      confidenceReasons:
-        completeness >= 70
-          ? ['Partido persistido en PostgreSQL. Modelos Elo/ML completos se activan en Fases 5–7.']
-          : ['Datos parciales en PostgreSQL (importación CSV sin xG/alineaciones completas).'],
-      // Campos informativos de resultado si ya finalizó
+      confidenceReasons,
       ...(row.home_goals !== null && row.away_goals !== null
         ? { actualScore: `${row.home_goals}-${row.away_goals}`, matchStatus: row.status }
         : { matchStatus: row.status }),
-    } as MatchRecord;
+    };
   });
 }
 
@@ -801,35 +1073,89 @@ export async function createPredictionSnapshotInDb(input: {
   selectedSelection: string;
   predictedProb: number;
   oddsAtPrediction: number;
+  bookmaker?: string | null;
+  fairOdds?: number | null;
 }) {
   const pool = requirePool();
+
+  const matchCheck = await pool.query<{ kickoff_utc: Date; status: string }>(
+    'SELECT kickoff_utc, status FROM matches WHERE id = $1',
+    [input.matchId]
+  );
+  if (matchCheck.rowCount === 0) {
+    const err = new Error('Partido no encontrado en PostgreSQL.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+  const m = matchCheck.rows[0];
+  if (m.status === 'finished' || new Date(m.kickoff_utc).getTime() <= Date.now()) {
+    const err = new Error(
+      'Registro bloqueado: el partido ya comenzó o finalizó. Las predicciones deben guardarse antes del inicio.'
+    );
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
   const id = `pred_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const modelVersionId = input.modelVersionId ?? 'ensemble-v1-phase3';
+  const fairOdds =
+    input.fairOdds ?? Number((1 / Math.max(0.01, Math.min(0.99, input.predictedProb))).toFixed(4));
 
-  const res = await pool.query<{ id: string; created_at: Date }>(
-    `INSERT INTO predictions (
-      id, match_id, model_version_id, data_completeness_score, confidence_tier,
-      expected_score, model_outputs, markets, score_matrix,
-      selected_market, selected_selection, predicted_prob, odds_at_prediction, source_type
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, 'db')
-    RETURNING id, created_at`,
-    [
-      id,
-      input.matchId,
-      modelVersionId,
-      input.dataCompletenessScore,
-      input.confidenceTier,
-      input.expectedScore,
-      JSON.stringify(input.modelOutputs),
-      JSON.stringify(input.markets),
-      JSON.stringify(input.scoreMatrix ?? []),
-      input.selectedMarket,
-      input.selectedSelection,
-      input.predictedProb,
-      input.oddsAtPrediction,
-    ]
-  );
+  let res: { rows: { id: string; created_at: Date }[] };
+  try {
+    res = await pool.query<{ id: string; created_at: Date }>(
+      `INSERT INTO predictions (
+        id, match_id, model_version_id, data_completeness_score, confidence_tier,
+        expected_score, model_outputs, markets, score_matrix,
+        selected_market, selected_selection, predicted_prob, odds_at_prediction,
+        bookmaker, fair_odds, source_type
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, 'db')
+      RETURNING id, created_at`,
+      [
+        id,
+        input.matchId,
+        modelVersionId,
+        input.dataCompletenessScore,
+        input.confidenceTier,
+        input.expectedScore,
+        JSON.stringify(input.modelOutputs),
+        JSON.stringify(input.markets),
+        JSON.stringify(input.scoreMatrix ?? []),
+        input.selectedMarket,
+        input.selectedSelection,
+        input.predictedProb,
+        input.oddsAtPrediction,
+        input.bookmaker ?? null,
+        fairOdds,
+      ]
+    );
+  } catch {
+    res = await pool.query<{ id: string; created_at: Date }>(
+      `INSERT INTO predictions (
+        id, match_id, model_version_id, data_completeness_score, confidence_tier,
+        expected_score, model_outputs, markets, score_matrix,
+        selected_market, selected_selection, predicted_prob, odds_at_prediction, source_type
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, 'db')
+      RETURNING id, created_at`,
+      [
+        id,
+        input.matchId,
+        modelVersionId,
+        input.dataCompletenessScore,
+        input.confidenceTier,
+        input.expectedScore,
+        JSON.stringify(input.modelOutputs),
+        JSON.stringify(input.markets),
+        JSON.stringify(input.scoreMatrix ?? []),
+        input.selectedMarket,
+        input.selectedSelection,
+        input.predictedProb,
+        input.oddsAtPrediction,
+      ]
+    );
+  }
 
   return {
     id: res.rows[0].id,
@@ -953,6 +1279,10 @@ export async function updateMatchResultInDb(
       [matchId]
     );
     await client.query('COMMIT');
+    // Liquidar automáticamente predicciones y oportunidades de valor vinculadas a este partido
+    await import('../services/engine/monitoringService.ts')
+      .then((mod) => mod.autoSettleAllPendingInDb())
+      .catch(() => {});
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -1136,4 +1466,276 @@ export async function updateActiveModelConfigInDb(input: {
      WHERE is_active = TRUE`,
     [JSON.stringify(input.weights), JSON.stringify(input.thresholds)]
   );
+}
+
+export async function saveDetectedValueOpportunity(input: {
+  matchId: string;
+  modelVersionId?: string;
+  market: string;
+  selection: string;
+  bookmaker: string;
+  modelProb: number;
+  decimalOdds: number;
+  impliedProbRaw: number;
+  impliedProbDevig: number | null;
+  fairOdds: number;
+  edgePp: number;
+  expectedValue: number;
+  confidenceTier: ConfidenceTier;
+  oddsCapturedAt?: string | null;
+}) {
+  const pool = requirePool();
+  const matchCheck = await pool.query<{ kickoff_utc: Date; status: string }>(
+    'SELECT kickoff_utc, status FROM matches WHERE id = $1',
+    [input.matchId]
+  );
+  if (matchCheck.rowCount === 0) {
+    const err = new Error('Partido no encontrado en PostgreSQL.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+  const m = matchCheck.rows[0];
+  if (m.status === 'finished' || new Date(m.kickoff_utc).getTime() <= Date.now()) {
+    const err = new Error('Cuota caducada: el partido ya comenzó o finalizó.');
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
+  const id = `vopp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+  let res: { rows: { id: string }[] };
+  try {
+    res = await pool.query<{ id: string }>(
+      `INSERT INTO value_opportunities_log (
+        id, match_id, model_version_id, market, selection, bookmaker,
+        model_prob, decimal_odds, opening_odds, implied_prob_raw, implied_prob_devig,
+        fair_odds, edge_pp, expected_value, confidence_tier, odds_captured_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, $12, $13, $14, COALESCE($15::timestamptz, NOW()))
+      ON CONFLICT ON CONSTRAINT uq_value_opp_match_sel DO UPDATE SET
+        model_version_id = EXCLUDED.model_version_id,
+        model_prob = EXCLUDED.model_prob,
+        decimal_odds = EXCLUDED.decimal_odds,
+        opening_odds = COALESCE(value_opportunities_log.opening_odds, EXCLUDED.opening_odds),
+        implied_prob_raw = EXCLUDED.implied_prob_raw,
+        implied_prob_devig = EXCLUDED.implied_prob_devig,
+        fair_odds = EXCLUDED.fair_odds,
+        edge_pp = EXCLUDED.edge_pp,
+        expected_value = EXCLUDED.expected_value,
+        confidence_tier = EXCLUDED.confidence_tier,
+        odds_captured_at = EXCLUDED.odds_captured_at
+      RETURNING id`,
+      [
+        id,
+        input.matchId,
+        input.modelVersionId ?? 'ensemble-v2-p5',
+        input.market,
+        input.selection,
+        input.bookmaker,
+        input.modelProb,
+        input.decimalOdds,
+        input.impliedProbRaw,
+        input.impliedProbDevig,
+        input.fairOdds,
+        input.edgePp,
+        input.expectedValue,
+        input.confidenceTier,
+        input.oddsCapturedAt ?? null,
+      ]
+    );
+  } catch {
+    res = await pool.query<{ id: string }>(
+      `INSERT INTO value_opportunities_log (
+        id, match_id, model_version_id, market, selection, bookmaker,
+        model_prob, decimal_odds, implied_prob_raw, implied_prob_devig,
+        fair_odds, edge_pp, expected_value, confidence_tier, odds_captured_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, COALESCE($15::timestamptz, NOW()))
+      ON CONFLICT ON CONSTRAINT uq_value_opp_match_sel DO UPDATE SET
+        model_version_id = EXCLUDED.model_version_id,
+        model_prob = EXCLUDED.model_prob,
+        decimal_odds = EXCLUDED.decimal_odds,
+        implied_prob_raw = EXCLUDED.implied_prob_raw,
+        implied_prob_devig = EXCLUDED.implied_prob_devig,
+        fair_odds = EXCLUDED.fair_odds,
+        edge_pp = EXCLUDED.edge_pp,
+        expected_value = EXCLUDED.expected_value,
+        confidence_tier = EXCLUDED.confidence_tier,
+        odds_captured_at = EXCLUDED.odds_captured_at
+      RETURNING id`,
+      [
+        id,
+        input.matchId,
+        input.modelVersionId ?? 'ensemble-v2-p5',
+        input.market,
+        input.selection,
+        input.bookmaker,
+        input.modelProb,
+        input.decimalOdds,
+        input.impliedProbRaw,
+        input.impliedProbDevig,
+        input.fairOdds,
+        input.edgePp,
+        input.expectedValue,
+        input.confidenceTier,
+        input.oddsCapturedAt ?? null,
+      ]
+    );
+  }
+
+  return { id: res.rows[0].id };
+}
+
+export async function getDetectedValueOpportunities(
+  leagueId?: string
+): Promise<DetectedValueOpportunityRecord[]> {
+  const pool = requirePool();
+  const params: unknown[] = [];
+  let whereSql = '';
+  if (leagueId && leagueId !== 'all') {
+    params.push(leagueId);
+    whereSql = 'WHERE m.league_id = $1';
+  }
+
+  try {
+    const res = await pool.query<{
+      id: string;
+      match_id: string;
+      home_name: string;
+      away_name: string;
+      league_id: LeagueId;
+      kickoff_utc: Date;
+      model_version_id: string;
+      market: string;
+      selection: string;
+      bookmaker: string;
+      model_prob: string;
+      decimal_odds: string;
+      opening_odds: string | null;
+      closing_odds: string | null;
+      clv_pct: string | null;
+      implied_prob_raw: string;
+      implied_prob_devig: string | null;
+      fair_odds: string;
+      edge_pp: string;
+      expected_value: string;
+      confidence_tier: ConfidenceTier;
+      odds_captured_at: Date;
+      status: 'pendiente' | 'ganada' | 'perdida' | 'anulada';
+      actual_result: string | null;
+      realized_roi_unit: string | null;
+      created_at: Date;
+      settled_at: Date | null;
+    }>(
+      `SELECT
+        v.id, v.match_id, ht.name AS home_name, at.name AS away_name,
+        m.league_id, m.kickoff_utc,
+        v.model_version_id, v.market, v.selection, v.bookmaker,
+        v.model_prob, v.decimal_odds, v.opening_odds, v.closing_odds, v.clv_pct,
+        v.implied_prob_raw, v.implied_prob_devig,
+        v.fair_odds, v.edge_pp, v.expected_value, v.confidence_tier,
+        v.odds_captured_at, v.status, v.actual_result, v.realized_roi_unit,
+        v.created_at, v.settled_at
+       FROM value_opportunities_log v
+       JOIN matches m ON m.id = v.match_id
+       JOIN teams ht ON ht.id = m.home_team_id
+       JOIN teams at ON at.id = m.away_team_id
+       ${whereSql}
+       ORDER BY v.created_at DESC
+       LIMIT 150`,
+      params
+    );
+
+    return res.rows.map((r) => ({
+      id: r.id,
+      matchId: r.match_id,
+      matchLabel: `${r.home_name} vs ${r.away_name}`,
+      leagueId: r.league_id,
+      kickoffUtc: new Date(r.kickoff_utc).toISOString(),
+      modelVersionId: r.model_version_id,
+      market: r.market,
+      selection: r.selection,
+      bookmaker: r.bookmaker,
+      modelProb: Number(r.model_prob),
+      decimalOdds: Number(r.decimal_odds),
+      openingOdds: r.opening_odds !== null ? Number(r.opening_odds) : null,
+      closingOdds: r.closing_odds !== null ? Number(r.closing_odds) : null,
+      clvPct: r.clv_pct !== null ? Number(r.clv_pct) : null,
+      impliedProbRaw: Number(r.implied_prob_raw),
+      impliedProbDevig: r.implied_prob_devig !== null ? Number(r.implied_prob_devig) : null,
+      fairOdds: Number(r.fair_odds),
+      edgePp: Number(r.edge_pp),
+      expectedValue: Number(r.expected_value),
+      confidenceTier: r.confidence_tier,
+      oddsCapturedAt: new Date(r.odds_captured_at).toISOString(),
+      status: r.status,
+      actualResult: r.actual_result,
+      realizedRoiUnit: r.realized_roi_unit !== null ? Number(r.realized_roi_unit) : null,
+      createdAt: new Date(r.created_at).toISOString(),
+      settledAt: r.settled_at ? new Date(r.settled_at).toISOString() : null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function settleDetectedValueOpportunities(): Promise<{ settledCount: number }> {
+  const pool = requirePool();
+  const pendingRes = await pool.query<{
+    id: string;
+    market: string;
+    selection: string;
+    decimal_odds: string;
+    home_goals: number;
+    away_goals: number;
+    home_name: string;
+    away_name: string;
+  }>(
+    `SELECT
+      v.id, v.market, v.selection, v.decimal_odds,
+      mr.home_goals, mr.away_goals,
+      ht.name AS home_name, at.name AS away_name
+     FROM value_opportunities_log v
+     JOIN matches m ON m.id = v.match_id
+     JOIN match_results mr ON mr.match_id = m.id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     WHERE v.status = 'pendiente' AND m.status = 'finished'`
+  );
+
+  let settledCount = 0;
+  for (const row of pendingRes.rows) {
+    const hg = row.home_goals;
+    const ag = row.away_goals;
+    const total = hg + ag;
+    let won = false;
+
+    if (row.market === 'Resultado 1X2') {
+      if (row.selection.includes('(1)') || row.selection.includes(row.home_name)) {
+        won = hg > ag;
+      } else if (row.selection.includes('(X)') || row.selection.toLowerCase().includes('empate')) {
+        won = hg === ag;
+      } else if (row.selection.includes('(2)') || row.selection.includes(row.away_name)) {
+        won = ag > hg;
+      }
+    } else if (row.market === 'Goles') {
+      if (row.selection.includes('Más de 2.5')) won = total > 2;
+      else if (row.selection.includes('Menos de 2.5')) won = total < 3;
+    }
+
+    const odds = Number(row.decimal_odds);
+    const roiUnit = won ? Number((odds - 1).toFixed(4)) : -1;
+    const status = won ? 'ganada' : 'perdida';
+    const actualResult = `${hg}-${ag}`;
+
+    await pool.query(
+      `UPDATE value_opportunities_log
+       SET status = $2, actual_result = $3, realized_roi_unit = $4, settled_at = NOW()
+       WHERE id = $1`,
+      [row.id, status, actualResult, roiUnit]
+    );
+    settledCount += 1;
+  }
+
+  return { settledCount };
 }

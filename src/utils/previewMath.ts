@@ -160,6 +160,120 @@ export function computePoissonScoreMatrix(
 }
 
 /**
+ * Matriz de marcadores con ajuste Dixon-Coles (tau/rho) para marcadores bajos (0-0, 1-0, 0-1, 1-1).
+ */
+export function computeDixonColesScoreMatrix(
+  lambdaHome: number,
+  lambdaAway: number,
+  rho = -0.09,
+  maxGoals = 6
+): {
+  matrix: ScoreMatrixCell[];
+  markets: MatchMarketsAnalysis;
+  threeWay: ThreeWayProbabilities;
+} {
+  const tauFn = (hg: number, ag: number) => {
+    if (hg === 0 && ag === 0) return Math.max(0.05, 1 - lambdaHome * lambdaAway * rho);
+    if (hg === 1 && ag === 0) return Math.max(0.05, 1 + lambdaAway * rho);
+    if (hg === 0 && ag === 1) return Math.max(0.05, 1 + lambdaHome * rho);
+    if (hg === 1 && ag === 1) return Math.max(0.05, 1 - rho);
+    return 1;
+  };
+
+  const matrix: ScoreMatrixCell[] = [];
+  let totalMass = 0;
+
+  for (let hg = 0; hg <= maxGoals; hg += 1) {
+    const ph = poissonPmf(hg, lambdaHome);
+    for (let ag = 0; ag <= maxGoals; ag += 1) {
+      const pa = poissonPmf(ag, lambdaAway);
+      const prob = ph * pa * tauFn(hg, ag);
+      totalMass += prob;
+      matrix.push({ homeGoals: hg, awayGoals: ag, probability: prob });
+    }
+  }
+
+  const norm = totalMass > 0 ? 1 / totalMass : 1;
+  let pHome = 0, pDraw = 0, pAway = 0;
+  let o05 = 0, o15 = 0, o25 = 0, o35 = 0, o45 = 0, btts = 0;
+  let ho05 = 0, ho15 = 0, ho25 = 0, ao05 = 0, ao15 = 0, ao25 = 0;
+
+  const normalizedMatrix = matrix.map((cell) => {
+    const p = cell.probability * norm;
+    if (cell.homeGoals > cell.awayGoals) pHome += p;
+    else if (cell.homeGoals === cell.awayGoals) pDraw += p;
+    else pAway += p;
+
+    const total = cell.homeGoals + cell.awayGoals;
+    if (total > 0) o05 += p;
+    if (total > 1) o15 += p;
+    if (total > 2) o25 += p;
+    if (total > 3) o35 += p;
+    if (total > 4) o45 += p;
+    if (cell.homeGoals > 0 && cell.awayGoals > 0) btts += p;
+    if (cell.homeGoals > 0) ho05 += p;
+    if (cell.homeGoals > 1) ho15 += p;
+    if (cell.homeGoals > 2) ho25 += p;
+    if (cell.awayGoals > 0) ao05 += p;
+    if (cell.awayGoals > 1) ao15 += p;
+    if (cell.awayGoals > 2) ao25 += p;
+
+    return { ...cell, probability: p };
+  });
+
+  return {
+    matrix: normalizedMatrix,
+    threeWay: { home: pHome, draw: pDraw, away: pAway },
+    markets: {
+      result: {
+        homeWin: pHome,
+        draw: pDraw,
+        awayWin: pAway,
+        dc1X: pHome + pDraw,
+        dcX2: pDraw + pAway,
+        dc12: pHome + pAway,
+      },
+      goals: {
+        over05: o05,
+        over15: o15,
+        over25: o25,
+        over35: o35,
+        over45: o45,
+        under15: 1 - o15,
+        under25: 1 - o25,
+        under35: 1 - o35,
+        under45: 1 - o45,
+        bttsYes: btts,
+        bttsNo: 1 - btts,
+      },
+      teamGoals: {
+        homeOver05: ho05,
+        homeOver15: ho15,
+        homeOver25: ho25,
+        awayOver05: ao05,
+        awayOver15: ao15,
+        awayOver25: ao25,
+      },
+      corners: {
+        available: false,
+        expectedTotal: null,
+        expectedHome: null,
+        expectedAway: null,
+        over95Prob: null,
+        under95Prob: null,
+      },
+      cards: {
+        available: false,
+        expectedTotal: null,
+        expectedHome: null,
+        expectedAway: null,
+        disciplinaryRisk: null,
+      },
+    },
+  };
+}
+
+/**
  * Estima mercados de córners y tarjetas solo cuando ambos equipos poseen promedios válidos.
  */
 export function estimateAuxMarkets(
@@ -278,6 +392,7 @@ export function calculateValueMetrics(
 export function combineEnsembleProbabilities(
   models: {
     poisson: ThreeWayProbabilities;
+    dixonColes?: ThreeWayProbabilities;
     elo: ThreeWayProbabilities;
     machineLearning: ThreeWayProbabilities;
     recentForm: ThreeWayProbabilities;
@@ -285,6 +400,14 @@ export function combineEnsembleProbabilities(
   },
   weights: EnsembleWeights
 ): ThreeWayProbabilities {
+  const poissonTerm = models.dixonColes
+    ? {
+        home: models.dixonColes.home * 0.65 + models.poisson.home * 0.35,
+        draw: models.dixonColes.draw * 0.65 + models.poisson.draw * 0.35,
+        away: models.dixonColes.away * 0.65 + models.poisson.away * 0.35,
+      }
+    : models.poisson;
+
   const totalWeight =
     weights.poisson +
     weights.elo +
@@ -293,11 +416,11 @@ export function combineEnsembleProbabilities(
     weights.homeAway;
 
   if (totalWeight <= 0) {
-    return models.poisson;
+    return poissonTerm;
   }
 
   const home =
-    (models.poisson.home * weights.poisson +
+    (poissonTerm.home * weights.poisson +
       models.elo.home * weights.elo +
       models.machineLearning.home * weights.machineLearning +
       models.recentForm.home * weights.recentForm +
@@ -305,7 +428,7 @@ export function combineEnsembleProbabilities(
     totalWeight;
 
   const draw =
-    (models.poisson.draw * weights.poisson +
+    (poissonTerm.draw * weights.poisson +
       models.elo.draw * weights.elo +
       models.machineLearning.draw * weights.machineLearning +
       models.recentForm.draw * weights.recentForm +
@@ -313,7 +436,7 @@ export function combineEnsembleProbabilities(
     totalWeight;
 
   const away =
-    (models.poisson.away * weights.poisson +
+    (poissonTerm.away * weights.poisson +
       models.elo.away * weights.elo +
       models.machineLearning.away * weights.machineLearning +
       models.recentForm.away * weights.recentForm +

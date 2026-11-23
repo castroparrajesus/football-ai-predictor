@@ -13,15 +13,27 @@ import {
   SANDBOX_TEAMS,
 } from './data/sandboxDataset';
 import {
+  ActiveTrainedModelInfo,
+  BacktestReproductionResult,
+  BacktestRunSummary,
   CalibrationBin,
+  DataAuditReport,
   DataSourceMode,
   DbStatusSummary,
+  DetectedValueOpportunityRecord,
   EnsembleWeights,
   LeagueFilter,
   MatchRecord,
+  MonitoringConfigState,
+  MonitoringDashboardData,
   NavSectionId,
+  OddsHistoryTimeline,
   PredictionHistoryItem,
+  ProviderId,
+  ProviderStatusInfo,
   QualityFilterThresholds,
+  SyncExecutionSummary,
+  SyncLogEntry,
   TeamStatisticalProfile,
   ValueOpportunity,
 } from './types/football';
@@ -29,6 +41,7 @@ import {
   calculateValueMetrics,
   combineEnsembleProbabilities,
   computeBrierScoreBinary,
+  computeDixonColesScoreMatrix,
   computeLogLossBinary,
   computePoissonScoreMatrix,
 } from './utils/previewMath';
@@ -55,6 +68,7 @@ import { ValueFinderView } from './views/ValueFinderView';
 import { ModelComparatorView } from './views/ModelComparatorView';
 import { HistoryView } from './views/HistoryView';
 import { PerformanceView } from './views/PerformanceView';
+import { MonitoringView } from './views/MonitoringView';
 import { SettingsView } from './views/SettingsView';
 
 export default function App() {
@@ -71,6 +85,32 @@ export default function App() {
   const [dbCalibrationBins, setDbCalibrationBins] = useState<CalibrationBin[]>([]);
   const [isMigrating, setIsMigrating] = useState(false);
   const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
+
+  // Estado de proveedores deportivos reales (Fase 4)
+  const [providers, setProviders] = useState<ProviderStatusInfo[]>([]);
+  const [syncLogs, setSyncLogs] = useState<SyncLogEntry[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncExecutionSummary | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  // Estado Fase 5: Auditoría, Backtesting Walk-Forward, Modelo Activo y Bitácora de Valor
+  const [auditReport, setAuditReport] = useState<DataAuditReport | null>(null);
+  const [backtestHistory, setBacktestHistory] = useState<BacktestRunSummary[]>([]);
+  const [activeTrainedModel, setActiveTrainedModel] = useState<ActiveTrainedModelInfo | null>(null);
+  const [savedValueOpps, setSavedValueOpps] = useState<DetectedValueOpportunityRecord[]>([]);
+  const [isRunningBacktest, setIsRunningBacktest] = useState(false);
+  const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [isSavingOppId, setIsSavingOppId] = useState<string | null>(null);
+  const [isSettlingOpps, setIsSettlingOpps] = useState(false);
+
+  // Estado Fase 6: Reproducibilidad, Histórico Inmutable de Cuotas y Monitorización
+  const [reproductionResult, setReproductionResult] = useState<BacktestReproductionResult | null>(null);
+  const [isReproducing, setIsReproducing] = useState(false);
+  const [monitoringData, setMonitoringData] = useState<MonitoringDashboardData | null>(null);
+  const [oddsTimelines, setOddsTimelines] = useState<OddsHistoryTimeline[]>([]);
+  const [isMonitoringLoading, setIsMonitoringLoading] = useState(false);
+  const [monitoringActionMessage, setMonitoringActionMessage] = useState<string | null>(null);
+  const [monitoringActionError, setMonitoringActionError] = useState<string | null>(null);
 
   // CSV temporal y modal de confirmación
   const [csvMatches, setCsvMatches] = useState<MatchRecord[]>([]);
@@ -93,12 +133,30 @@ export default function App() {
   const [sandboxHistory, setSandboxHistory] = useState<PredictionHistoryItem[]>(SANDBOX_HISTORY);
 
   const loadPersistedData = useCallback(async (league: LeagueFilter) => {
-    const [matchesRes, teamsRes, historyRes, perfRes, configRes] = await Promise.all([
+    const [
+      matchesRes,
+      teamsRes,
+      historyRes,
+      perfRes,
+      configRes,
+      auditRes,
+      btHistoryRes,
+      activeModelRes,
+      valueOppsRes,
+      monitoringRes,
+      oddsHistoryRes,
+    ] = await Promise.all([
       apiClient.getMatches(league),
       apiClient.getTeams(league),
       apiClient.getPredictionHistory(league),
       apiClient.getPerformance(league),
       apiClient.getModelConfig(),
+      apiClient.getAuditReport().catch(() => null),
+      apiClient.getBacktestHistory().catch(() => []),
+      apiClient.getActiveTrainedModel().catch(() => null),
+      apiClient.getValueOpportunities(league).catch(() => []),
+      apiClient.getMonitoringDashboard(league).catch(() => null),
+      apiClient.getOddsHistory(league).catch(() => []),
     ]);
     setDbMatches(matchesRes);
     setDbTeams(teamsRes);
@@ -108,6 +166,12 @@ export default function App() {
       setWeights(configRes.weights);
       setThresholds(configRes.thresholds);
     }
+    setAuditReport(auditRes);
+    setBacktestHistory(btHistoryRes);
+    setActiveTrainedModel(activeModelRes);
+    setSavedValueOpps(valueOppsRes);
+    setMonitoringData(monitoringRes);
+    setOddsTimelines(oddsHistoryRes);
   }, []);
 
   const refreshDbHealth = useCallback(
@@ -128,8 +192,19 @@ export default function App() {
     [loadPersistedData, selectedLeague]
   );
 
+  const refreshProvidersStatus = useCallback(async () => {
+    try {
+      const res = await apiClient.getProvidersStatus();
+      setProviders(res.providers);
+      setSyncLogs(res.recentLogs);
+    } catch (err) {
+      console.error('Error checking provider status:', err);
+    }
+  }, []);
+
   useEffect(() => {
     refreshDbHealth(true);
+    refreshProvidersStatus();
     // Solo comprobación inicial al montar
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -153,10 +228,39 @@ export default function App() {
           : 'Todas las migraciones ya estaban aplicadas.';
       setMigrationMessage(msg);
       await refreshDbHealth(true);
+      await refreshProvidersStatus();
     } catch (err) {
       setMigrationMessage(err instanceof Error ? err.message : 'Error ejecutando migraciones.');
     } finally {
       setIsMigrating(false);
+    }
+  };
+
+  const handleRunProviderSync = async (params: {
+    provider: ProviderId;
+    leagueId: LeagueFilter;
+    seasonYear?: number;
+    includeOdds: boolean;
+  }) => {
+    setIsSyncing(true);
+    setSyncError(null);
+    setSyncResult(null);
+    try {
+      const summary = await apiClient.runProviderSync(params);
+      setSyncResult(summary);
+      setDataSourceMode('database');
+      await Promise.all([
+        refreshDbHealth(false),
+        refreshProvidersStatus(),
+        loadPersistedData(selectedLeague),
+      ]);
+    } catch (err) {
+      setSyncError(
+        err instanceof Error ? err.message : 'Error ejecutando sincronización deportiva.'
+      );
+      await refreshProvidersStatus();
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -203,12 +307,22 @@ export default function App() {
 
   const valueOpportunities = useMemo<ValueOpportunity[]>(() => {
     const list: ValueOpportunity[] = [];
+    const nowMs = Date.now();
     for (const match of activeMatches) {
       if (!match.odds1X2) continue;
+
+      const kickoffMs = match.kickoffUtc
+        ? Date.parse(match.kickoffUtc)
+        : Date.parse(`${match.date}T${match.kickoffTime}:00Z`);
+      const isExpiredOdds =
+        !match.isSynthetic &&
+        (match.matchStatus === 'finished' ||
+          (Number.isFinite(kickoffMs) && kickoffMs <= nowMs));
 
       const ensemble = combineEnsembleProbabilities(
         {
           poisson: match.models.poisson,
+          dixonColes: match.models.dixonColes,
           elo: match.models.elo,
           machineLearning: match.models.machineLearning,
           recentForm: match.models.recentForm,
@@ -245,15 +359,22 @@ export default function App() {
       ];
 
       if (match.extraOdds?.over25) {
-        const poisson = computePoissonScoreMatrix(
-          match.expectedLambdaHome,
-          match.expectedLambdaAway
-        );
+        const scoreCalc =
+          match.dixonColesRho !== undefined
+            ? computeDixonColesScoreMatrix(
+                match.expectedLambdaHome,
+                match.expectedLambdaAway,
+                match.dixonColesRho
+              )
+            : computePoissonScoreMatrix(
+                match.expectedLambdaHome,
+                match.expectedLambdaAway
+              );
         candidates.push({
           suffix: 'o25',
           market: 'Goles',
           selection: 'Más de 2.5 goles',
-          prob: poisson.markets.goals.over25,
+          prob: scoreCalc.markets.goals.over25,
           odds: match.extraOdds.over25,
           deVig: null,
         });
@@ -268,7 +389,8 @@ export default function App() {
         const meetsEv = evPct >= thresholds.minExpectedValuePct;
 
         let rejectionReason: string | undefined;
-        if (!meetsTier) rejectionReason = `Nivel ${match.confidenceTier} insuficiente`;
+        if (isExpiredOdds) rejectionReason = 'Cuota caducada (partido iniciado/finalizado)';
+        else if (!meetsTier) rejectionReason = `Nivel ${match.confidenceTier} insuficiente`;
         else if (!meetsCompleteness) rejectionReason = `Completitud < ${thresholds.minCompletenessPct}%`;
         else if (!meetsSpread) rejectionReason = `Discrepancia > ${thresholds.maxModelSpreadPct} pp`;
         else if (!meetsEv) rejectionReason = `EV < ${thresholds.minExpectedValuePct}%`;
@@ -289,13 +411,18 @@ export default function App() {
           expectedValue: metrics.expectedValue,
           confidenceTier: match.confidenceTier,
           hasStatisticalValue: Boolean(
-            !thresholds.strictModeNoForce &&
+            !isExpiredOdds &&
+              !thresholds.strictModeNoForce &&
               meetsTier &&
               meetsCompleteness &&
               meetsSpread &&
               meetsEv
           ),
           rejectionReason,
+          bookmaker: match.odds1X2.bookmaker,
+          oddsCapturedAt: match.oddsCapturedAt ?? null,
+          isExpiredOdds,
+          kickoffUtc: match.kickoffUtc,
         });
       }
     }
@@ -415,6 +542,169 @@ export default function App() {
     }
   };
 
+  const handleRunBacktest = async (params: {
+    leagueId: LeagueFilter;
+    calibrationMethod: 'platt' | 'isotonic' | 'none';
+    trainAndActivate: boolean;
+  }) => {
+    setIsRunningBacktest(true);
+    setBacktestError(null);
+    try {
+      await apiClient.runBacktest(params);
+      await loadPersistedData(selectedLeague);
+    } catch (err) {
+      setBacktestError(
+        err instanceof Error ? err.message : 'Error ejecutando backtesting walk-forward.'
+      );
+    } finally {
+      setIsRunningBacktest(false);
+    }
+  };
+
+  const handleSaveValueOpportunity = async (opp: ValueOpportunity) => {
+    setIsSavingOppId(opp.id);
+    try {
+      await apiClient.saveValueOpportunity({
+        matchId: opp.matchId,
+        modelVersionId: activeTrainedModel?.id ?? 'ensemble-v2-p5',
+        market: opp.market,
+        selection: opp.selection,
+        bookmaker: opp.bookmaker ?? 'Market',
+        modelProb: opp.modelProb,
+        decimalOdds: opp.decimalOdds,
+        impliedProbRaw: opp.impliedProbRaw,
+        impliedProbDevig: opp.impliedProbNoMargin,
+        fairOdds: opp.fairOdds,
+        edgePp: Number((opp.edge * 100).toFixed(2)),
+        expectedValue: opp.expectedValue,
+        confidenceTier: opp.confidenceTier,
+        oddsCapturedAt: opp.oddsCapturedAt ?? null,
+      });
+      const updated = await apiClient.getValueOpportunities(selectedLeague);
+      setSavedValueOpps(updated);
+    } catch (err) {
+      console.error('Error saving value opportunity:', err);
+    } finally {
+      setIsSavingOppId(null);
+    }
+  };
+
+  const handleSettleValueOpportunities = async () => {
+    setIsSettlingOpps(true);
+    try {
+      await apiClient.settleValueOpportunities();
+      const updated = await apiClient.getValueOpportunities(selectedLeague);
+      setSavedValueOpps(updated);
+    } catch (err) {
+      console.error('Error settling value opportunities:', err);
+    } finally {
+      setIsSettlingOpps(false);
+    }
+  };
+
+  const handleReproduceBacktest = async (runId: string) => {
+    setIsReproducing(true);
+    setBacktestError(null);
+    try {
+      const result = await apiClient.reproduceBacktest(runId);
+      setReproductionResult(result);
+    } catch (err) {
+      setBacktestError(
+        err instanceof Error ? err.message : 'Error reproduciendo ejecución de backtesting.'
+      );
+    } finally {
+      setIsReproducing(false);
+    }
+  };
+
+  const handleRefreshMonitoring = async () => {
+    setIsMonitoringLoading(true);
+    setMonitoringActionError(null);
+    try {
+      await loadPersistedData(selectedLeague);
+    } catch (err) {
+      setMonitoringActionError(
+        err instanceof Error ? err.message : 'Error actualizando panel de monitorización.'
+      );
+    } finally {
+      setIsMonitoringLoading(false);
+    }
+  };
+
+  const handleUpdateMonitoringConfig = async (partial: Partial<MonitoringConfigState>) => {
+    setMonitoringActionError(null);
+    try {
+      const updated = await apiClient.updateMonitoringConfig(partial);
+      setMonitoringData((prev) => (prev ? { ...prev, config: updated } : prev));
+      setMonitoringActionMessage('Configuración de monitorización guardada en PostgreSQL.');
+    } catch (err) {
+      setMonitoringActionError(
+        err instanceof Error ? err.message : 'Error guardando configuración de monitorización.'
+      );
+    }
+  };
+
+  const handleCaptureOddsNow = async (league: LeagueFilter) => {
+    setIsMonitoringLoading(true);
+    setMonitoringActionMessage(null);
+    setMonitoringActionError(null);
+    try {
+      const res = await apiClient.captureOddsNow(league);
+      if (!res.executed) {
+        setMonitoringActionError(res.skippedReason ?? 'Captura de cuotas omitida.');
+      } else {
+        setMonitoringActionMessage(
+          `Snapshot de cuotas completado: ${res.oddsInserted} registros inmutables añadidos (${res.requestsUsed} peticiones, cuota: ${res.quotaRemaining ?? 'N/D'}).`
+        );
+      }
+      await loadPersistedData(selectedLeague);
+    } catch (err) {
+      setMonitoringActionError(
+        err instanceof Error ? err.message : 'Error capturando snapshot de cuotas.'
+      );
+    } finally {
+      setIsMonitoringLoading(false);
+    }
+  };
+
+  const handleCaptureUpcomingPredictions = async (league: LeagueFilter) => {
+    setIsMonitoringLoading(true);
+    setMonitoringActionMessage(null);
+    setMonitoringActionError(null);
+    try {
+      const res = await apiClient.captureUpcomingPredictions(league);
+      setMonitoringActionMessage(
+        `Seguimiento pre-partido actualizado (${res.modelVersionId}): ${res.registeredCount} registradas (${res.withMarketOddsCount} con cuota real), ${res.skippedExisting} ya existentes, ${res.skippedDiscarded} descartadas.`
+      );
+      await Promise.all([refreshDbHealth(false), loadPersistedData(selectedLeague)]);
+    } catch (err) {
+      setMonitoringActionError(
+        err instanceof Error ? err.message : 'Error registrando predicciones pre-partido.'
+      );
+    } finally {
+      setIsMonitoringLoading(false);
+    }
+  };
+
+  const handleAutoSettleMonitoring = async () => {
+    setIsMonitoringLoading(true);
+    setMonitoringActionMessage(null);
+    setMonitoringActionError(null);
+    try {
+      const res = await apiClient.autoSettlePending();
+      setMonitoringActionMessage(
+        `Liquidación automática ejecutada: ${res.settledPredictions} predicciones y ${res.settledValueOpportunities} oportunidades Value Finder liquidadas.`
+      );
+      await loadPersistedData(selectedLeague);
+    } catch (err) {
+      setMonitoringActionError(
+        err instanceof Error ? err.message : 'Error ejecutando auto-liquidación.'
+      );
+    } finally {
+      setIsMonitoringLoading(false);
+    }
+  };
+
   const analyzedHomeTeam = analyzedMatch
     ? activeTeams.find((t) => t.id === analyzedMatch.homeTeamId)
     : undefined;
@@ -512,6 +802,12 @@ export default function App() {
             <ValueFinderView
               opportunities={valueOpportunities}
               thresholds={thresholds}
+              dataSourceMode={dataSourceMode}
+              savedOpportunities={savedValueOpps}
+              isSavingOppId={isSavingOppId}
+              isSettlingOpps={isSettlingOpps}
+              onSaveOpportunity={handleSaveValueOpportunity}
+              onSettleOpportunities={handleSettleValueOpportunities}
             />
           )}
 
@@ -534,6 +830,34 @@ export default function App() {
             <PerformanceView
               history={activeHistory}
               calibrationBins={activeCalibrationBins}
+              dataSourceMode={dataSourceMode}
+              auditReport={auditReport}
+              backtestHistory={backtestHistory}
+              activeTrainedModel={activeTrainedModel}
+              isRunningBacktest={isRunningBacktest}
+              backtestError={backtestError}
+              onRunBacktest={handleRunBacktest}
+              reproductionResult={reproductionResult}
+              isReproducing={isReproducing}
+              onReproduceBacktest={handleReproduceBacktest}
+            />
+          )}
+
+          {activeSection === 'monitoring' && (
+            <MonitoringView
+              dataSourceMode={dataSourceMode}
+              selectedLeague={selectedLeague}
+              monitoring={monitoringData}
+              oddsTimelines={oddsTimelines}
+              auditReport={auditReport}
+              isLoading={isMonitoringLoading}
+              actionMessage={monitoringActionMessage}
+              actionError={monitoringActionError}
+              onRefresh={handleRefreshMonitoring}
+              onUpdateConfig={handleUpdateMonitoringConfig}
+              onCaptureOddsNow={handleCaptureOddsNow}
+              onCaptureUpcomingPredictions={handleCaptureUpcomingPredictions}
+              onAutoSettle={handleAutoSettleMonitoring}
             />
           )}
 
@@ -546,9 +870,18 @@ export default function App() {
               migrationMessage={migrationMessage}
               onRefreshDbStatus={() => refreshDbHealth(false)}
               onRunMigrations={handleRunMigrations}
+              providers={providers}
+              syncLogs={syncLogs}
+              isSyncing={isSyncing}
+              syncResult={syncResult}
+              syncError={syncError}
+              onRefreshProviders={refreshProvidersStatus}
+              onRunSync={handleRunProviderSync}
               thresholds={thresholds}
               onUpdateThresholds={handleUpdateThresholds}
               onDownloadCsvTemplate={handleDownloadCsvTemplate}
+              activeTrainedModel={activeTrainedModel}
+              backtestCount={backtestHistory.length}
             />
           )}
         </main>

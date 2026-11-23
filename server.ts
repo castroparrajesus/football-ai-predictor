@@ -8,6 +8,7 @@ import {
   createPredictionSnapshotInDb,
   getActiveModelConfigFromDb,
   getDbStatusSummary,
+  getDetectedValueOpportunities,
   getLeaguesFromDb,
   getMatchesFromDb,
   getPerformanceMetricsFromDb,
@@ -15,10 +16,30 @@ import {
   getSeasonsFromDb,
   getTeamsFromDb,
   persistCsvBatchToDb,
+  saveDetectedValueOpportunity,
+  settleDetectedValueOpportunities,
   settlePredictionInDb,
   updateActiveModelConfigInDb,
   updateMatchResultInDb,
 } from './src/db/repository.ts';
+import { dataSyncService } from './src/services/providers/DataSyncService.ts';
+import { runDatabaseAudit } from './src/services/engine/dataAudit.ts';
+import {
+  getActiveTrainedModelFromDb,
+  getBacktestByRunId,
+  getBacktestHistoryFromDb,
+  reproduceBacktestByRunId,
+  runWalkForwardBacktest,
+} from './src/services/engine/backtestService.ts';
+import {
+  autoSettleAllPendingInDb,
+  capturePreMatchOddsSnapshot,
+  captureUpcomingPredictionsBatchInDb,
+  getMonitoringDashboardData,
+  getOddsHistoryTimelines,
+  startMonitoringScheduler,
+  updateMonitoringConfig,
+} from './src/services/engine/monitoringService.ts';
 
 dotenv.config();
 
@@ -82,6 +103,8 @@ const createPredictionSchema = z.object({
   selectedSelection: z.string().min(1).max(120),
   predictedProb: z.number().gt(0).lt(1),
   oddsAtPrediction: z.number().gte(1.0).max(500),
+  bookmaker: z.string().max(80).nullable().optional(),
+  fairOdds: z.number().gt(1.0).max(500).nullable().optional(),
 });
 
 const matchResultSchema = z.object({
@@ -112,10 +135,64 @@ const modelConfigSchema = z.object({
   }),
 });
 
+const syncRunSchema = z.object({
+  provider: z.enum(['football_data', 'api_football', 'the_odds_api']),
+  leagueId: z.enum([
+    'premier_league',
+    'laliga',
+    'serie_a',
+    'bundesliga',
+    'ligue_1',
+    'all',
+  ]),
+  seasonYear: z.number().int().min(2020).max(2030).optional(),
+  includeOdds: z.boolean().optional(),
+});
+
+const backtestRunSchema = z.object({
+  leagueId: z
+    .enum(['premier_league', 'laliga', 'serie_a', 'bundesliga', 'ligue_1', 'all'])
+    .default('all'),
+  seasonId: z.string().max(25).optional(),
+  calibrationMethod: z.enum(['platt', 'isotonic', 'none']).default('platt'),
+  trainAndActivate: z.boolean().default(true),
+});
+
+const valueOppCreateSchema = z.object({
+  matchId: z.string().min(1).max(150),
+  modelVersionId: z.string().max(80).optional(),
+  market: z.string().min(1).max(100),
+  selection: z.string().min(1).max(120),
+  bookmaker: z.string().min(1).max(80),
+  modelProb: z.number().gt(0).lt(1),
+  decimalOdds: z.number().gt(1.0).max(500),
+  impliedProbRaw: z.number().gt(0).lt(1),
+  impliedProbDevig: z.number().gt(0).lt(1).nullable(),
+  fairOdds: z.number().gt(1.0).max(500),
+  edgePp: z.number().min(-100).max(100),
+  expectedValue: z.number().min(-1).max(50),
+  confidenceTier: z.enum(['A', 'B', 'C', 'DESCARTADO']),
+  oddsCapturedAt: z.string().nullable().optional(),
+});
+
+const monitoringConfigSchema = z.object({
+  autoOddsCaptureEnabled: z.boolean().optional(),
+  captureIntervalMinutes: z.number().int().min(30).max(1440).optional(),
+  closingWindowMinutes: z.number().int().min(15).max(240).optional(),
+  minRemainingCreditsGuard: z.number().int().min(0).max(10000).optional(),
+  autoSettleEnabled: z.boolean().optional(),
+});
+
+const leagueScopeBodySchema = z.object({
+  leagueId: z
+    .enum(['premier_league', 'laliga', 'serie_a', 'bundesliga', 'ligue_1', 'all'])
+    .default('all'),
+});
+
 function handleApiError(res: Response, err: unknown, fallbackMessage: string) {
   const status = (err as { statusCode?: number })?.statusCode ?? 500;
   const message =
-    status === 503 || status === 404
+    status === 503 || status === 404 || status === 400
       ? (err as Error).message
       : fallbackMessage;
   if (status >= 500) {
@@ -144,6 +221,60 @@ async function startServer() {
       res.json({ ok: true, data: result });
     } catch (err) {
       handleApiError(res, err, 'Error ejecutando migraciones en PostgreSQL.');
+    }
+  });
+
+  // Proveedores de datos deportivos reales (Fase 4)
+  app.get('/api/providers/status', async (_req: Request, res: Response) => {
+    try {
+      const data = await dataSyncService.getProvidersStatus();
+      res.json({ ok: true, data });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando estado de proveedores de datos.');
+    }
+  });
+
+  app.post('/api/sync/run', async (req: Request, res: Response) => {
+    const parsed = syncRunSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        ok: false,
+        error: 'Parámetros de sincronización inválidos.',
+        details: parsed.error.issues.slice(0, 5),
+      });
+      return;
+    }
+
+    try {
+      const summary = await dataSyncService.syncFromProvider({
+        provider: parsed.data.provider,
+        leagueFilter: parsed.data.leagueId,
+        seasonYear: parsed.data.seasonYear,
+        includeOdds: parsed.data.includeOdds,
+      });
+      res.json({ ok: true, data: summary });
+    } catch (err) {
+      const status = (err as { statusCode?: number })?.statusCode;
+      if (status) {
+        handleApiError(res, err, 'Error sincronizando datos desde el proveedor.');
+        return;
+      }
+      // Errores controlados de proveedor externo (cuota, permisos, HTTP)
+      const providerMsg =
+        err instanceof Error &&
+        (err.message.includes('429') ||
+          err.message.includes('401') ||
+          err.message.includes('403') ||
+          err.message.includes('Football-Data.org') ||
+          err.message.includes('API-Football') ||
+          err.message.includes('The Odds API') ||
+          err.message.includes('ODDS_API_KEY') ||
+          err.message.includes('API_FOOTBALL_KEY') ||
+          err.message.includes('FOOTBALL_DATA_API_KEY'))
+          ? err.message
+          : 'Error obteniendo o guardando datos del proveedor deportivo.';
+      console.error('[Sync Error]:', err instanceof Error ? err.message : err);
+      res.status(502).json({ ok: false, error: providerMsg });
     }
   });
 
@@ -302,6 +433,232 @@ async function startServer() {
     }
   });
 
+  // Motor Predictivo Avanzado, Auditoría y Backtesting Walk-Forward (Fase 5)
+  app.get('/api/audit', async (_req: Request, res: Response) => {
+    try {
+      const report = await runDatabaseAudit();
+      res.json({ ok: true, data: report });
+    } catch (err) {
+      handleApiError(res, err, 'Error ejecutando auditoría de base de datos.');
+    }
+  });
+
+  app.get('/api/backtest/history', async (_req: Request, res: Response) => {
+    try {
+      const history = await getBacktestHistoryFromDb();
+      res.json({ ok: true, data: history });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando historial de backtesting.');
+    }
+  });
+
+  app.post('/api/backtest/run', async (req: Request, res: Response) => {
+    const parsed = backtestRunSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        ok: false,
+        error: 'Parámetros de backtesting inválidos.',
+        details: parsed.error.issues.slice(0, 5),
+      });
+      return;
+    }
+
+    try {
+      const activeCfg = await getActiveModelConfigFromDb().catch(() => null);
+      const result = await runWalkForwardBacktest({
+        leagueFilter: parsed.data.leagueId,
+        seasonId: parsed.data.seasonId,
+        calibrationMethod: parsed.data.calibrationMethod,
+        weights: activeCfg?.weights,
+        persistRun: true,
+        trainAndActivate: parsed.data.trainAndActivate,
+      });
+      res.json({ ok: true, data: result.summary });
+    } catch (err) {
+      handleApiError(res, err, 'Error ejecutando entrenamiento y backtest walk-forward.');
+    }
+  });
+
+  app.get('/api/model/active', async (_req: Request, res: Response) => {
+    try {
+      const active = await getActiveTrainedModelFromDb();
+      if (!active) {
+        res.json({ ok: true, data: null });
+        return;
+      }
+      res.json({
+        ok: true,
+        data: {
+          id: active.id,
+          name: active.name,
+          weights: active.weights,
+          calibrationMethod: active.calibrationMethod,
+          trainedUntilUtc: active.trainedUntilUtc,
+          rho: active.rho,
+          mlTrainedSamples: active.mlModel.trainedSamples,
+          evalMetrics: active.evalMetrics,
+        },
+      });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando versión de modelo activa.');
+    }
+  });
+
+  app.get('/api/value-opportunities', async (req: Request, res: Response) => {
+    try {
+      const league = typeof req.query.league === 'string' ? req.query.league : undefined;
+      const rows = await getDetectedValueOpportunities(league);
+      res.json({ ok: true, data: rows });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando oportunidades de valor registradas.');
+    }
+  });
+
+  app.post('/api/value-opportunities', async (req: Request, res: Response) => {
+    const parsed = valueOppCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        ok: false,
+        error: 'Datos de oportunidad de valor inválidos.',
+        details: parsed.error.issues.slice(0, 5),
+      });
+      return;
+    }
+
+    try {
+      const created = await saveDetectedValueOpportunity(parsed.data);
+      res.status(201).json({ ok: true, data: created });
+    } catch (err) {
+      handleApiError(res, err, 'Error registrando oportunidad de valor.');
+    }
+  });
+
+  app.post('/api/value-opportunities/settle', async (_req: Request, res: Response) => {
+    try {
+      const settled = await settleDetectedValueOpportunities();
+      res.json({ ok: true, data: settled });
+    } catch (err) {
+      handleApiError(res, err, 'Error liquidando oportunidades de valor pendientes.');
+    }
+  });
+
+  // Fase 6: Reproducibilidad de backtesting, histórico inmutable de cuotas, seguimiento y monitorización
+  app.get('/api/backtest/:runId', async (req: Request, res: Response) => {
+    const runId = req.params.runId;
+    if (!runId || runId.length > 80) {
+      res.status(400).json({ ok: false, error: 'Identificador de backtest inválido.' });
+      return;
+    }
+    try {
+      const summary = await getBacktestByRunId(runId);
+      if (!summary) {
+        res.status(404).json({ ok: false, error: 'Ejecución de backtesting no encontrada.' });
+        return;
+      }
+      res.json({ ok: true, data: summary });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando ejecución de backtesting.');
+    }
+  });
+
+  app.post('/api/backtest/:runId/reproduce', async (req: Request, res: Response) => {
+    const runId = req.params.runId;
+    if (!runId || runId.length > 80) {
+      res.status(400).json({ ok: false, error: 'Identificador de backtest inválido.' });
+      return;
+    }
+    try {
+      const reproduction = await reproduceBacktestByRunId(runId);
+      res.json({ ok: true, data: reproduction });
+    } catch (err) {
+      handleApiError(res, err, 'Error reproduciendo backtesting por runId.');
+    }
+  });
+
+  app.get('/api/monitoring/dashboard', async (req: Request, res: Response) => {
+    try {
+      const leagueId = typeof req.query.league === 'string' ? req.query.league : undefined;
+      const data = await getMonitoringDashboardData({ leagueId });
+      res.json({ ok: true, data });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando panel de monitorización y control.');
+    }
+  });
+
+  app.put('/api/monitoring/config', async (req: Request, res: Response) => {
+    const parsed = monitoringConfigSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        ok: false,
+        error: 'Configuración de monitorización inválida.',
+        details: parsed.error.issues.slice(0, 5),
+      });
+      return;
+    }
+    try {
+      const updated = await updateMonitoringConfig(parsed.data);
+      res.json({ ok: true, data: updated });
+    } catch (err) {
+      handleApiError(res, err, 'Error guardando configuración de monitorización.');
+    }
+  });
+
+  app.get('/api/odds/history', async (req: Request, res: Response) => {
+    try {
+      const leagueId = typeof req.query.league === 'string' ? req.query.league : undefined;
+      const limit =
+        typeof req.query.limit === 'string' && Number.isFinite(Number(req.query.limit))
+          ? Math.max(10, Math.min(400, Number(req.query.limit)))
+          : 180;
+      const timelines = await getOddsHistoryTimelines({ leagueId, limit });
+      res.json({ ok: true, data: timelines });
+    } catch (err) {
+      handleApiError(res, err, 'Error consultando histórico inmutable de cuotas.');
+    }
+  });
+
+  app.post('/api/odds/capture-now', async (req: Request, res: Response) => {
+    const parsed = leagueScopeBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ ok: false, error: 'Ámbito de liga inválido para captura de cuotas.' });
+      return;
+    }
+    try {
+      const result = await capturePreMatchOddsSnapshot({
+        leagueId: parsed.data.leagueId,
+        respectCreditGuard: true,
+      });
+      res.json({ ok: true, data: result });
+    } catch (err) {
+      handleApiError(res, err, 'Error capturando snapshot pre-partido de cuotas.');
+    }
+  });
+
+  app.post('/api/predictions/capture-upcoming', async (req: Request, res: Response) => {
+    const parsed = leagueScopeBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ ok: false, error: 'Ámbito de liga inválido.' });
+      return;
+    }
+    try {
+      const result = await captureUpcomingPredictionsBatchInDb({
+        leagueId: parsed.data.leagueId,
+      });
+      res.json({ ok: true, data: result });
+    } catch (err) {
+      handleApiError(res, err, 'Error registrando predicciones pre-partido en lote.');
+    }
+  });
+
+  app.post('/api/predictions/auto-settle', async (_req: Request, res: Response) => {
+    try {
+      const result = await autoSettleAllPendingInDb();
+      res.json({ ok: true, data: result });
+    } catch (err) {
+      handleApiError(res, err, 'Error ejecutando liquidación automática de resultados.');
+    }
+  });
+
   if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -318,6 +675,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Football AI Predictor] Server listening on http://0.0.0.0:${PORT}`);
+    startMonitoringScheduler();
   });
 }
 

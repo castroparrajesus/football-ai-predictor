@@ -9,6 +9,7 @@ import {
   GitCompare,
   History,
   BarChart3,
+  Activity,
   Settings,
   X,
 } from 'lucide-react';
@@ -30,6 +31,7 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'model_comparator', label: 'Comparador de modelos', icon: GitCompare },
   { id: 'history', label: 'Historial', icon: History },
   { id: 'performance', label: 'Rendimiento', icon: BarChart3 },
+  { id: 'monitoring', label: 'Monitorización y Cuotas', icon: Activity },
   { id: 'settings', label: 'Configuración', icon: Settings },
 ];
 
@@ -92,7 +94,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="px-4 py-3.5 border-t border-slate-800/80 text-xs text-slate-500">
         <div className="flex items-center justify-between">
           <span>5 Grandes Ligas</span>
-          <span className="font-mono text-slate-400">Fase 1–2</span>
+          <span className="font-mono text-slate-400">Fase 1–6</span>
         </div>
       </div>
     </div>

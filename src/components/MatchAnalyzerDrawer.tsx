@@ -11,6 +11,7 @@ import { LEAGUES_CATALOG } from '../data/sandboxDataset';
 import {
   calculateValueMetrics,
   combineEnsembleProbabilities,
+  computeDixonColesScoreMatrix,
   computePoissonScoreMatrix,
   estimateAuxMarkets,
   formatPct,
@@ -58,19 +59,25 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'markets' | 'matrix' | 'teams'>('markets');
   const [showFullMatrix, setShowFullMatrix] = useState(false);
+  const [matrixModel, setMatrixModel] = useState<'dixon_coles' | 'poisson'>('dixon_coles');
   const [savedNotice, setSavedNotice] = useState(false);
 
   const analysis = useMemo(() => {
     if (!match) return null;
-    const poissonCalc = computePoissonScoreMatrix(
-      match.expectedLambdaHome,
-      match.expectedLambdaAway,
-      6
-    );
+    const useDc = matrixModel === 'dixon_coles' && match.dixonColesRho !== undefined;
+    const scoreCalc = useDc
+      ? computeDixonColesScoreMatrix(
+          match.expectedLambdaHome,
+          match.expectedLambdaAway,
+          match.dixonColesRho,
+          6
+        )
+      : computePoissonScoreMatrix(match.expectedLambdaHome, match.expectedLambdaAway, 6);
     const aux = estimateAuxMarkets(homeTeam, awayTeam);
     const dynamicEnsemble = combineEnsembleProbabilities(
       {
         poisson: match.models.poisson,
+        dixonColes: match.models.dixonColes,
         elo: match.models.elo,
         machineLearning: match.models.machineLearning,
         recentForm: match.models.recentForm,
@@ -79,21 +86,22 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
       weights
     );
 
-    const topScores = [...poissonCalc.matrix]
+    const topScores = [...scoreCalc.matrix]
       .sort((a, b) => b.probability - a.probability)
       .slice(0, 6);
 
     return {
-      matrix: poissonCalc.matrix,
+      matrix: scoreCalc.matrix,
       topScores,
       markets: {
-        ...poissonCalc.markets,
+        ...scoreCalc.markets,
         corners: aux.corners,
         cards: aux.cards,
       },
       dynamicEnsemble,
+      usingDixonColes: useDc,
     };
-  }, [match, homeTeam, awayTeam, weights]);
+  }, [match, homeTeam, awayTeam, weights, matrixModel]);
 
   if (!match || !analysis) return null;
 
@@ -243,6 +251,13 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
           <MissingDataNotice notes={match.missingDataNotes} />
 
+          {match.smallSampleWarning && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>{match.smallSampleWarning}</span>
+            </div>
+          )}
+
           {match.confidenceTier === 'DESCARTADO' && (
             <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-200 flex items-start gap-3">
               <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
@@ -281,11 +296,13 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
                     </thead>
                     <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums text-xs">
                       {[
-                        { name: 'Poisson (Goles esperados)', data: match.models.poisson },
+                        { name: 'Poisson Independiente (λ)', data: match.models.poisson },
+                        ...(match.models.dixonColes
+                          ? [{ name: `Dixon-Coles (ρ=${match.dixonColesRho ?? -0.09})`, data: match.models.dixonColes }]
+                          : []),
                         { name: 'Elo dinámico', data: match.models.elo },
-                        { name: 'Machine Learning', data: match.models.machineLearning },
-                        { name: 'Forma reciente (5/10/15)', data: match.models.recentForm },
-                        { name: 'Modelo Local / Visitante', data: match.models.homeAway },
+                        { name: 'ML Regresión Logística L2', data: match.models.machineLearning },
+                        { name: 'Estadísticas Of./Def. & Forma', data: match.models.recentForm },
                         ...(match.models.marketDeVigged
                           ? [{ name: 'Mercado sin margen (De-vigged)', data: match.models.marketDeVigged }]
                           : []),
@@ -298,14 +315,57 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
                         </tr>
                       ))}
                       <tr className="bg-emerald-500/8 font-semibold">
-                        <td className="px-4 py-3 font-sans text-emerald-300">Ensemble Final Ponderado</td>
+                        <td className="px-4 py-3 font-sans text-emerald-300">Ensemble Calibrado Ponderado</td>
                         <td className="px-4 py-3 text-right text-emerald-300">{formatPct(analysis.dynamicEnsemble.home)}</td>
                         <td className="px-4 py-3 text-right text-emerald-300">{formatPct(analysis.dynamicEnsemble.draw)}</td>
                         <td className="px-4 py-3 text-right text-emerald-300">{formatPct(analysis.dynamicEnsemble.away)}</td>
                       </tr>
+                      {match.confidenceInterval90 && (
+                        <tr className="bg-[#0B0F17] text-[11px] text-slate-400">
+                          <td className="px-4 py-2 font-sans">Intervalo de confianza 90% (Wilson)</td>
+                          <td className="px-4 py-2 text-right">
+                            {formatPct(match.confidenceInterval90.home[0], 0)}–{formatPct(match.confidenceInterval90.home[1], 0)}
+                          </td>
+                          <td className="px-4 py-2 text-right">
+                            {formatPct(match.confidenceInterval90.draw[0], 0)}–{formatPct(match.confidenceInterval90.draw[1], 0)}
+                          </td>
+                          <td className="px-4 py-2 text-right">
+                            {formatPct(match.confidenceInterval90.away[0], 0)}–{formatPct(match.confidenceInterval90.away[1], 0)}
+                          </td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 </div>
+
+                {match.keyFactors && match.keyFactors.length > 0 && (
+                  <div className="mt-4 rounded-lg border border-slate-800 bg-[#111827] p-4 space-y-2.5">
+                    <h4 className="font-display text-xs font-semibold uppercase tracking-wide text-slate-400">
+                      Factores que explican el pronóstico
+                    </h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                      {match.keyFactors.map((kf) => (
+                        <div
+                          key={kf.label}
+                          className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-[#0B0F17] border border-slate-800/80"
+                        >
+                          <span className="text-slate-400">{kf.label}</span>
+                          <span
+                            className={`font-mono tabular-nums ${
+                              kf.impact === 'home'
+                                ? 'text-emerald-400'
+                                : kf.impact === 'away'
+                                ? 'text-sky-400'
+                                : 'text-slate-200'
+                            }`}
+                          >
+                            {kf.value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </section>
 
               {/* Value check vs 1X2 odds */}
@@ -486,19 +546,34 @@ export const MatchAnalyzerDrawer: React.FC<MatchAnalyzerDrawerProps> = ({
             <div className="space-y-5">
               <div className="rounded-lg border border-slate-800 bg-[#111827] p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div>
-                  <div className="text-xs text-slate-400">Goles esperados (Poisson lambda)</div>
-                  <div className="font-mono text-base font-semibold text-slate-100 mt-0.5">
+                  <div className="text-xs text-slate-400">
+                    Goles esperados ({analysis.usingDixonColes ? `Dixon-Coles ρ=${match.dixonColesRho}` : 'Poisson independiente'})
+                  </div>
+                  <div className="font-mono text-base font-semibold text-slate-100 mt-0.5 tabular-nums">
                     {match.homeTeamName}: {match.expectedLambdaHome.toFixed(2)} · {match.awayTeamName}:{' '}
                     {match.expectedLambdaAway.toFixed(2)}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowFullMatrix((prev) => !prev)}
-                  className="px-3 py-1.5 rounded-md border border-slate-700 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"
-                >
-                  {showFullMatrix ? 'Vista estándar (0–5)' : 'Ampliar distribución (0–6)'}
-                </button>
+                <div className="flex items-center gap-2">
+                  {match.dixonColesRho !== undefined && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setMatrixModel((m) => (m === 'dixon_coles' ? 'poisson' : 'dixon_coles'))
+                      }
+                      className="px-3 py-1.5 rounded-md border border-slate-700 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"
+                    >
+                      {analysis.usingDixonColes ? 'Cambiar a Poisson' : 'Usar Dixon-Coles'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowFullMatrix((prev) => !prev)}
+                    className="px-3 py-1.5 rounded-md border border-slate-700 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"
+                  >
+                    {showFullMatrix ? 'Vista estándar (0–5)' : 'Ampliar distribución (0–6)'}
+                  </button>
+                </div>
               </div>
 
               <div>

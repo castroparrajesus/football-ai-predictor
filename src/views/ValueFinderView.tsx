@@ -1,17 +1,35 @@
 import React, { useState } from 'react';
-import { QualityFilterThresholds, ValueOpportunity } from '../types/football';
+import { BookmarkPlus, CheckCircle2, RefreshCw } from 'lucide-react';
+import {
+  DataSourceMode,
+  DetectedValueOpportunityRecord,
+  QualityFilterThresholds,
+  ValueOpportunity,
+} from '../types/football';
 import { calculateValueMetrics, formatPct, removeBookmakerMargin } from '../utils/previewMath';
 
 interface ValueFinderViewProps {
   opportunities: ValueOpportunity[];
   thresholds: QualityFilterThresholds;
+  dataSourceMode?: DataSourceMode;
+  savedOpportunities?: DetectedValueOpportunityRecord[];
+  isSavingOppId?: string | null;
+  isSettlingOpps?: boolean;
+  onSaveOpportunity?: (opp: ValueOpportunity) => void;
+  onSettleOpportunities?: () => void;
 }
 
 export const ValueFinderView: React.FC<ValueFinderViewProps> = ({
   opportunities,
   thresholds,
+  dataSourceMode = 'sandbox',
+  savedOpportunities = [],
+  isSavingOppId = null,
+  isSettlingOpps = false,
+  onSaveOpportunity,
+  onSettleOpportunities,
 }) => {
-  // Calculadora manual de Valor (Sección 8)
+  // Calculadora manual de Valor
   const [calcProbPct, setCalcProbPct] = useState<string>('55');
   const [calcOddsHome, setCalcOddsHome] = useState<string>('2.05');
   const [calcOddsOpp1, setCalcOddsOpp1] = useState<string>('3.50');
@@ -27,19 +45,33 @@ export const ValueFinderView: React.FC<ValueFinderViewProps> = ({
   const deVig = hasFullMarket ? removeBookmakerMargin([odds, o2, o3]) : null;
   const calc = calculateValueMetrics(prob, odds, deVig?.fairProbs[0] ?? null);
 
+  const activeNonExpired = opportunities.filter((o) => !o.isExpiredOdds);
+  const expiredCount = opportunities.length - activeNonExpired.length;
+
   const displayed = onlyValue
-    ? opportunities.filter((o) => o.hasStatisticalValue)
-    : opportunities;
+    ? activeNonExpired.filter((o) => o.hasStatisticalValue)
+    : activeNonExpired;
+
+  const savedKeySet = new Set(
+    savedOpportunities.map((s) => `${s.matchId}::${s.market}::${s.selection}`)
+  );
+
+  const settledSaved = savedOpportunities.filter((s) => s.status !== 'pendiente');
+  const realizedNetUnits = settledSaved.reduce(
+    (sum, s) => sum + (s.realizedRoiUnit ?? 0),
+    0
+  );
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="font-display text-lg font-semibold text-slate-100">
-          Detector de Valor Estadístico (Value Finder)
+          Buscador de Valor Estadístico (Value Finder)
         </h2>
         <p className="text-xs text-slate-400 mt-0.5">
-          Compara la probabilidad calibrada del modelo contra la cuota decimal del mercado y evalúa
-          el valor esperado matemático (EV). Una probabilidad alta sin precio favorable no constituye valor.
+          Compara la probabilidad calibrada del modelo contra cuotas reales vigentes antes del
+          inicio del partido. Las cuotas caducadas o con muestra insuficiente se excluyen
+          automáticamente.
         </p>
       </div>
 
@@ -143,15 +175,16 @@ export const ValueFinderView: React.FC<ValueFinderViewProps> = ({
         </div>
       </section>
 
-      {/* Scanner across active matches */}
+      {/* Scanner across active pre-kickoff matches */}
       <section className="rounded-lg border border-slate-800/80 bg-[#111827] p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h3 className="font-display text-sm font-semibold text-slate-100">
-              Escáner de Mercados vs Cuotas Disponibles
+              Escáner de Mercados Vigentes vs Cuotas Disponibles
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
               Umbral mínimo configurado: EV ≥ {thresholds.minExpectedValuePct}% y confianza A/B.
+              {expiredCount > 0 && ` · ${expiredCount} cuotas caducadas excluidas automáticamente.`}
             </p>
           </div>
           <button
@@ -169,7 +202,7 @@ export const ValueFinderView: React.FC<ValueFinderViewProps> = ({
 
         {displayed.length === 0 ? (
           <div className="py-8 text-center text-xs text-slate-400 border border-dashed border-slate-800 rounded-lg">
-            No se detectan selecciones con valor estadístico positivo bajo los criterios actuales.
+            No se detectan selecciones vigentes con valor estadístico positivo bajo los criterios actuales.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -177,53 +210,187 @@ export const ValueFinderView: React.FC<ValueFinderViewProps> = ({
               <thead className="text-slate-400 border-b border-slate-800">
                 <tr>
                   <th className="text-left py-2.5 pr-3 font-medium">Partido / Selección</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">Prob. Modelo</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">Cuota</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">Impl. Bruta</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">Sin Margen</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">Cuota Justa</th>
-                  <th className="text-right px-2.5 py-2.5 font-medium">EV</th>
-                  <th className="text-right pl-2.5 py-2.5 font-medium">Estado</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Prob.</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Cuota</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Sin Margen</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Justa</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Edge</th>
+                  <th className="text-right px-2 py-2.5 font-medium">EV</th>
+                  <th className="text-right px-2 py-2.5 font-medium">Estado</th>
+                  {dataSourceMode === 'database' && onSaveOpportunity && (
+                    <th className="text-right pl-2 py-2.5 font-medium">Auditoría</th>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
-                {displayed.map((opp) => (
-                  <tr key={opp.id} className="hover:bg-slate-800/30">
-                    <td className="py-3 pr-3 font-sans">
-                      <div className="font-medium text-slate-100">{opp.matchLabel}</div>
-                      <div className="text-[11px] text-slate-400">
-                        {opp.market} · {opp.selection} (Nivel {opp.confidenceTier})
-                      </div>
-                    </td>
-                    <td className="px-2.5 py-3 text-right text-slate-200">{formatPct(opp.modelProb)}</td>
-                    <td className="px-2.5 py-3 text-right text-slate-200">{opp.decimalOdds.toFixed(2)}</td>
-                    <td className="px-2.5 py-3 text-right text-slate-400">{formatPct(opp.impliedProbRaw)}</td>
-                    <td className="px-2.5 py-3 text-right text-slate-300">
-                      {opp.impliedProbNoMargin !== null ? formatPct(opp.impliedProbNoMargin) : 'N/D'}
-                    </td>
-                    <td className="px-2.5 py-3 text-right text-slate-200">{opp.fairOdds.toFixed(2)}</td>
-                    <td
-                      className={`px-2.5 py-3 text-right font-semibold ${
-                        opp.expectedValue > 0 ? 'text-emerald-400' : 'text-rose-400'
-                      }`}
-                    >
-                      {opp.expectedValue >= 0 ? '+' : ''}
-                      {(opp.expectedValue * 100).toFixed(1)}%
-                    </td>
-                    <td className="pl-2.5 py-3 text-right font-sans">
-                      {opp.hasStatisticalValue ? (
-                        <span className="text-emerald-400 font-medium">Valor detectado</span>
-                      ) : (
-                        <span className="text-slate-400">{opp.rejectionReason ?? 'Sin ventaja'}</span>
+                {displayed.map((opp) => {
+                  const alreadySaved = savedKeySet.has(
+                    `${opp.matchId}::${opp.market}::${opp.selection}`
+                  );
+                  return (
+                    <tr key={opp.id} className="hover:bg-slate-800/30">
+                      <td className="py-3 pr-3 font-sans">
+                        <div className="font-medium text-slate-100">{opp.matchLabel}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {opp.market} · {opp.selection} · Nivel {opp.confidenceTier}
+                          {opp.bookmaker ? ` · ${opp.bookmaker}` : ''}
+                        </div>
+                      </td>
+                      <td className="px-2 py-3 text-right text-slate-200">{formatPct(opp.modelProb)}</td>
+                      <td className="px-2 py-3 text-right text-slate-200">{opp.decimalOdds.toFixed(2)}</td>
+                      <td className="px-2 py-3 text-right text-slate-300">
+                        {opp.impliedProbNoMargin !== null ? formatPct(opp.impliedProbNoMargin) : 'N/D'}
+                      </td>
+                      <td className="px-2 py-3 text-right text-slate-200">{opp.fairOdds.toFixed(2)}</td>
+                      <td
+                        className={`px-2 py-3 text-right ${
+                          opp.edge >= 0 ? 'text-emerald-400' : 'text-slate-400'
+                        }`}
+                      >
+                        {opp.edge >= 0 ? '+' : ''}
+                        {(opp.edge * 100).toFixed(1)} pp
+                      </td>
+                      <td
+                        className={`px-2 py-3 text-right font-semibold ${
+                          opp.expectedValue > 0 ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {opp.expectedValue >= 0 ? '+' : ''}
+                        {(opp.expectedValue * 100).toFixed(1)}%
+                      </td>
+                      <td className="px-2 py-3 text-right font-sans">
+                        {opp.hasStatisticalValue ? (
+                          <span className="text-emerald-400 font-medium">Valor detectado</span>
+                        ) : (
+                          <span className="text-slate-400">{opp.rejectionReason ?? 'Sin ventaja'}</span>
+                        )}
+                      </td>
+                      {dataSourceMode === 'database' && onSaveOpportunity && (
+                        <td className="pl-2 py-3 text-right font-sans">
+                          {alreadySaved ? (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              Registrada
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={!opp.hasStatisticalValue || isSavingOppId === opp.id}
+                              onClick={() => onSaveOpportunity(opp)}
+                              className="px-2.5 py-1 rounded border border-slate-700 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-[11px] text-slate-200 inline-flex items-center gap-1"
+                            >
+                              <BookmarkPlus className="w-3 h-3 text-emerald-400" />
+                              <span>{isSavingOppId === opp.id ? '...' : 'Registrar'}</span>
+                            </button>
+                          )}
+                        </td>
                       )}
-                    </td>
-                  </tr>
-                ))}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </section>
+
+      {/* Persisted Value Opportunities Log & Settlement (Database Mode) */}
+      {dataSourceMode === 'database' && (
+        <section className="rounded-lg border border-slate-800/80 bg-[#111827] p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="font-display text-sm font-semibold text-slate-100">
+                Bitácora Auditada de Oportunidades Detectadas (PostgreSQL)
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5 font-mono tabular-nums">
+                {savedOpportunities.length} registradas · {settledSaved.length} liquidadas · Balance:{' '}
+                <span className={realizedNetUnits >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                  {realizedNetUnits >= 0 ? '+' : ''}
+                  {realizedNetUnits.toFixed(2)} u
+                </span>
+              </p>
+            </div>
+
+            {onSettleOpportunities && (
+              <button
+                type="button"
+                disabled={isSettlingOpps || savedOpportunities.length === 0}
+                onClick={onSettleOpportunities}
+                className="px-3 py-1.5 rounded-md border border-slate-700 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSettlingOpps ? 'animate-spin' : ''}`} />
+                <span>{isSettlingOpps ? 'Liquidando...' : 'Liquidar con resultados'}</span>
+              </button>
+            )}
+          </div>
+
+          {savedOpportunities.length === 0 ? (
+            <div className="py-6 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-lg">
+              Aún no has registrado oportunidades de valor pre-partido en PostgreSQL. Registra una
+              selección con EV positivo arriba para medir su rendimiento posterior.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="text-slate-400 border-b border-slate-800">
+                  <tr>
+                    <th className="text-left py-2 pr-3 font-medium">Partido / Selección</th>
+                    <th className="text-right px-2 py-2 font-medium">Prob.</th>
+                    <th className="text-right px-2 py-2 font-medium">Cuota</th>
+                    <th className="text-right px-2 py-2 font-medium">EV</th>
+                    <th className="text-right px-2 py-2 font-medium">Resultado</th>
+                    <th className="text-right pl-2 py-2 font-medium">ROI (u)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                  {savedOpportunities.map((s) => (
+                    <tr key={s.id}>
+                      <td className="py-2.5 pr-3 font-sans">
+                        <div className="text-slate-200 font-medium">{s.matchLabel}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {s.market} · {s.selection} · {s.bookmaker}
+                        </div>
+                      </td>
+                      <td className="px-2 py-2.5 text-right text-slate-200">{formatPct(s.modelProb)}</td>
+                      <td className="px-2 py-2.5 text-right text-slate-200">{s.decimalOdds.toFixed(2)}</td>
+                      <td className="px-2 py-2.5 text-right text-emerald-400">
+                        +{(s.expectedValue * 100).toFixed(1)}%
+                      </td>
+                      <td className="px-2 py-2.5 text-right font-sans">
+                        <span
+                          className={
+                            s.status === 'ganada'
+                              ? 'text-emerald-400'
+                              : s.status === 'perdida'
+                              ? 'text-rose-400'
+                              : 'text-slate-400'
+                          }
+                        >
+                          {s.status.toUpperCase()}
+                          {s.actualResult ? ` (${s.actualResult})` : ''}
+                        </span>
+                      </td>
+                      <td
+                        className={`pl-2 py-2.5 text-right ${
+                          s.realizedRoiUnit === null
+                            ? 'text-slate-500'
+                            : s.realizedRoiUnit >= 0
+                            ? 'text-emerald-400'
+                            : 'text-rose-400'
+                        }`}
+                      >
+                        {s.realizedRoiUnit !== null
+                          ? `${s.realizedRoiUnit >= 0 ? '+' : ''}${s.realizedRoiUnit.toFixed(2)}`
+                          : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 };
