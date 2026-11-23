@@ -1,0 +1,6 @@
+{
+  "name": "Football AI Predictor",
+  "description": "Calculadora predictiva de fútbol y plataforma de análisis estadístico multi-modelo para las cinco grandes ligas europeas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
